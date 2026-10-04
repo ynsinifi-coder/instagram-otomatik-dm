@@ -45,7 +45,6 @@ def save_history_to_cloud(history_data):
 
 # --- SPINTAX VE RASTGELELEŞTİRME ---
 def parse_spintax(text):
-    """5'li spintax veya alternatifli metinleri rastgele seçer."""
     if not text:
         return ""
     options = [opt.strip() for opt in text.split("---")]
@@ -53,7 +52,6 @@ def parse_spintax(text):
 
 # --- İNSTAGRAM KONTROL FONKSİYONLARI ---
 def check_if_following(user_id):
-    """Kullanıcının sayfayı takip edip etmediğini kontrol eder."""
     try:
         url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/followers"
         params = {"access_token": ACCESS_TOKEN}
@@ -64,10 +62,9 @@ def check_if_following(user_id):
                 return True
     except Exception as e:
         print(f"Takipçi kontrol hatası: {e}")
-    return True # API kısıtlarında akışın kesilmemesi için varsayılan True
+    return True
 
 def send_instagram_dm(user_id, message):
-    """Kullanıcıya DM gönderir."""
     try:
         url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/messages"
         payload = {
@@ -80,7 +77,6 @@ def send_instagram_dm(user_id, message):
         print(f"DM gönderme hatası: {e}")
 
 def reply_to_comment(comment_id, message):
-    """Yoruma yanıt verir."""
     try:
         url = f"https://graph.facebook.com/v18.0/{comment_id}/replies"
         payload = {
@@ -93,13 +89,12 @@ def reply_to_comment(comment_id, message):
 
 # --- ARKA PLAN ÇALIŞANI (BOT DÖNGÜSÜ) ---
 def background_bot_loop():
-    print("🤖 Instagram DM Botu bulut hafıza ile aktif edildi!")
+    print("🤖 Instagram DM Botu aktif edildi!")
     while True:
         try:
             rules = get_rules_from_cloud()
             history = get_history_from_cloud()
             
-            # Son yorumları Meta API üzerinden çek
             media_url = f"https://graph.facebook.com/v18.0/{IG_USER_ID}/media"
             media_res = requests.get(media_url, params={"access_token": ACCESS_TOKEN}).json()
             
@@ -117,17 +112,17 @@ def background_bot_loop():
                     if not user_id or comment_id in history:
                         continue
                     
-                    # Kurallarla eşleştirme
-                    for keyword, content in rules.items():
-                        if keyword.lower() in comment_text:
-                            # 15 Saniye Gecikme
-                            time.sleep(15)
+                    for keyword_group, content in rules.items():
+                        # Virgülle ayrılmış anahtar kelimeleri kontrol et
+                        keywords = [kw.strip().lower() for kw in keyword_group.split(",")]
+                        matched = any(kw in comment_text for kw in keywords if kw)
+                        
+                        if matched:
+                            time.sleep(15) # 15 saniye bekleme
                             
-                            # Takipçi Filtresi
                             if content.get("follower_only", False) and not check_if_following(user_id):
                                 continue
                             
-                            # Spintax Mesaj Seçimi
                             dm_text = parse_spintax(content.get("dm", ""))
                             comm_text = parse_spintax(content.get("comment", ""))
                             
@@ -136,72 +131,69 @@ def background_bot_loop():
                             if comm_text:
                                 reply_to_comment(comment_id, comm_text)
                             
-                            # İşlenen yorumu kaydet (Tekrar dönmemek için buluta yaz)
                             history[comment_id] = True
                             save_history_to_cloud(history)
                             break
         except Exception as ex:
             print(f"Bot döngü hatası: {ex}")
         
-        time.sleep(30) # Yeni yorumlar için döngü aralığı
+        time.sleep(30)
 
-# --- WEB PANELİ ARAYÜZÜ ---
+# --- ESKİ TARZ WEB PANELİ ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="tr">
 <head>
     <meta charset="UTF-8">
-    <title>LGSHocam DM Otomasyon Paneli</title>
+    <title>Instagram Otomasyon Paneli</title>
     <style>
-        body { font-family: Arial, sans-serif; background: #f4f6f9; margin: 0; padding: 20px; color: #333; }
-        .container { max-width: 800px; margin: auto; background: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
-        hh1, h2 { color: #2c3e50; text-align: center; }
-        .rule-card { background: #fafafa; border: 1px solid #ddd; padding: 15px; border-radius: 8px; margin-bottom: 15px; position: relative; }
-        input[type="text"], textarea { width: 100%; padding: 8px; margin-top: 5px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
-        button { background: #3498db; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-size: 16px; }
-        button:hover { background: #2980b9; }
-        .delete-btn { background: #e74c3c; float: right; padding: 5px 10px; font-size: 12px; }
-        .delete-btn:hover { background: #c0392b; }
-        .cloud-badge { background: #2ecc71; color: white; padding: 5px 10px; border-radius: 20px; font-size: 12px; display: inline-block; margin-bottom: 20px; }
+        body { font-family: Segoe UI, Tahoma, Geneva, Verdana, sans-serif; background: #eef2f3; margin: 0; padding: 20px; }
+        .container { max-width: 750px; margin: auto; background: #ffffff; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h2 { color: #333; border-bottom: 2px solid #eee; padding-bottom: 10px; }
+        label { font-weight: bold; color: #555; display: block; margin-top: 10px; }
+        input[type="text"], textarea { width: 100%; padding: 10px; margin-top: 5px; margin-bottom: 15px; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; }
+        button { background: #4CAF50; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 15px; }
+        button:hover { background: #45a049; }
+        .rule-box { background: #f9f9f9; border-left: 4px solid #4CAF50; padding: 12px; margin-bottom: 15px; border-radius: 4px; position: relative; }
+        .delete-btn { background: #ff4d4d; float: right; padding: 5px 10px; font-size: 12px; }
+        .delete-btn:hover { background: #cc0000; }
+        .cloud-info { background: #e8f5e9; color: #2e7d32; padding: 8px; border-radius: 5px; font-size: 13px; margin-bottom: 15px; text-align: center; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>@lgshocamm Otomasyon Paneli</h1>
-        <div style="text-align:center;"><span class="cloud-badge">☁️ Bulut Hafıza (Firebase) Aktif</span></div>
+        <h2>@lgshocamm Otomasyon Paneli</h2>
+        <div class="cloud-info">☁️ Bulut Hafıza Aktif (Kurallarınız silinmez)</div>
         
-        <h2>Yeni Kural Ekle</h2>
         <form method="POST" action="/add">
-            <label>Anahtar Kelime:</label>
-            <input type="text" name="keyword" placeholder="Örn: MATEMATİK" required>
+            <label>Anahtar Kelimeler (Birden fazla için virgül kullanın):</label>
+            <input type="text" name="keyword" placeholder="Örn: mat, matematik, lgs" required>
             
-            <label>DM Mesajları (Spintax için '---' ile ayırın - Max 5 varyasyon):</label>
-            <textarea name="dm" rows="3" placeholder="Harikasınız! Notlar için link: ... --- Süpersiniz, detaylar burada: ..."></textarea>
+            <label>DM Mesajları ('---' ile 5'li rotasyon yapabilirsiniz):</label>
+            <textarea name="dm" rows="3" placeholder="Merhaba link burada --- Selam detaylar bu mesajda"></textarea>
             
             <label>Yorum Yanıtları ('---' ile ayırın):</label>
             <textarea name="comm" rows="2" placeholder="DM gönderildi! --- Bilgi iletildi."></textarea>
             
             <label><input type="checkbox" name="follower_only" value="1" checked> Sadece Takipçilere Gönder</label><br><br>
             
-            <button type="submit">Kuralı Kaydet</button>
+            <button type="submit">Kuralı Ekle</button>
         </form>
 
-        <hr style="margin: 30px 0;">
-
-        <h2>Aktif Kurallarınız</h2>
+        <h2 style="margin-top: 40px;">Kayıtlı Kurallar</h2>
         {% for kw, data in rules.items() %}
-        <div class="rule-card">
+        <div class="rule-box">
             <form method="POST" action="/delete">
                 <input type="hidden" name="keyword" value="{{ kw }}">
                 <button type="submit" class="delete-btn">Sil</button>
             </form>
-            <strong>Anahtar Kelime:</strong> {{ kw }}<br>
-            <strong>DM İçeriği:</strong> {{ data.dm }}<br>
+            <strong>Anahtar Kelimeler:</strong> {{ kw }}<br>
+            <strong>DM:</strong> {{ data.dm }}<br>
             <strong>Yorum Yanıtı:</strong> {{ data.comment }}<br>
             <strong>Sadece Takipçi:</strong> {{ 'Evet' if data.follower_only else 'Hayır' }}
         </div>
         {% else %}
-        <p style="text-align: center; color: #7f8c8d;">Henüz kayıtlı bir kuralınız yok.</p>
+        <p style="color: #777; text-align: center;">Henüz kural eklenmemiş.</p>
         {% endfor %}
     </div>
 </body>
@@ -240,7 +232,6 @@ def delete_rule():
         save_rules_to_cloud(rules)
     return redirect(url_for("index"))
 
-# Arka plan botunu başlat
 threading.Thread(target=background_bot_loop, daemon=True).start()
 
 if __name__ == "__main__":
