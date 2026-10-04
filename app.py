@@ -171,6 +171,20 @@ def matches(text, keywords):
     return not keywords or any(normalized(k) in normalized(text) for k in keywords)
 
 
+def effective_rule(comment, rule):
+    """Altı planın ilk eşleşeni; eski tek kural biçimi korunur."""
+    plans = rule.get('plans')
+    if not plans:
+        return rule if matches(comment.get('text', ''), rule.get('keywords', [])) else None
+    text = normalized(comment.get('text', '').strip())
+    for plan in plans:
+        if text == normalized(plan['trigger'].strip()):
+            return dict(rule, keywords=[], dm_variants=plan['dm_variants'],
+                        reply_variants=plan['reply_variants'],
+                        created_at=max(rule['created_at'], plan.get('created_at', rule['created_at'])))
+    return None
+
+
 def follower_state(user_id):
     if not user_id:
         return None
@@ -196,6 +210,9 @@ def process_comment(media_id, comment, rule):
     cid = str(comment.get('id', ''))
     author = str((comment.get('from') or {}).get('id', ''))
     created = comment_time(comment)
+    rule = effective_rule(comment, rule)
+    if rule is None:
+        return
     now = time.time()
     if not cid or author == IG_USER_ID or created is None:
         return
@@ -225,7 +242,11 @@ def process_comment(media_id, comment, rule):
         state.update(status='cancelled')
         cloud('PUT', path, state)
         return
-    rule = current
+    rule = effective_rule(comment, current)
+    if rule is None:
+        state.update(status='cancelled')
+        cloud('PUT', path, state)
+        return
     if created < rule['created_at'] or not matches(comment.get('text', ''), rule.get('keywords', [])):
         state.update(status='cancelled')
         cloud('PUT', path, state)
@@ -306,6 +327,8 @@ HTML = '''<!doctype html><html lang="tr"><head><meta charset="utf-8"><meta name=
 <div class="stats"><div class="stat"><strong>{{ rules|length }}</strong><small>Eklenen video</small></div><div class="stat"><strong>{{ rules.values()|selectattr('enabled')|list|length }}</strong><small>Aktif kural</small></div><div class="stat"><strong>{{ media|length }}</strong><small>Hesaptan bulunan Reels</small></div></div>
 {% for msg in get_flashed_messages() %}<div class="alert flash" role="status">{{ msg }}</div>{% endfor %}
 <div class="layout"><section class="card"><h2>{{ 'Kuralını düzenle' if edit else 'Yeni otomasyon oluştur' }}</h2><p class="sub">Her videoya kendi mesajlarını ve hedef kitlesini tanımla.</p>
+{% if loading %}<div class="alert flash" role="status">Hesap bilgileri arka planda yükleniyor. Formu kullanabilirsin; listeyi görmek için biraz sonra <a href="{{ url_for('index', refresh='1') }}">yenile</a>.</div>{% endif %}
+{% if rules_error %}<div class="alert" role="alert">Kurallar okunamadı: {{ rules_error }}. Son yüklenen liste gösteriliyor.</div>{% endif %}
 {% if media_error %}<div class="alert" role="alert"><b>Videolar listelenemedi</b><br>{{ media_error }}</div>{% endif %}
 <form action="{{ url_for('save_rule') }}" method="post"><input type="hidden" name="csrf" value="{{ session.csrf }}">
 <div class="step">01 · VİDEONU SEÇ</div>
@@ -315,32 +338,76 @@ HTML = '''<!doctype html><html lang="tr"><head><meta charset="utf-8"><meta name=
 <details><summary class="tiny">Medya ID’si ile ekle</summary><input name="media_id" inputmode="numeric" pattern="[0-9]+" placeholder="Instagram medya ID’si"></details>{% endif %}
 <div class="step">02 · HEDEF KİTLE</div><div class="audiences"><label><input type="radio" name="audience" value="followers" {% if not edit or edit.get('follower_only', True) %}checked{% endif %}>Yalnızca takipçiler<small>Takip ettiği doğrulanan kişiler</small></label><label><input type="radio" name="audience" value="everyone" {% if edit and not edit.get('follower_only', True) %}checked{% endif %}>Herkes<small>Takip şartı olmadan uygun yorumlar</small></label></div>
 <small class="help">Takipçi modunda API takip durumunu okuyamazsa gönderim yapılmaz. Herkes modunda takip kontrolü atlanır.</small>
-<label for="keywords">Hangi yorumlar tetiklesin?</label><textarea id="keywords" name="keywords" rows="2" placeholder="MATEMATİK&#10;NOTLAR">{{ edit.keywords|join('\n') if edit else '' }}</textarea><small class="help">Her satıra bir anahtar kelime. Boşsa bütün yeni yorumlar.</small>
-<div class="step">03 · DM MESAJLARI</div><p class="sub">Dört farklı metin hazırla. Her yorumda bunlardan biri rastgele seçilir.</p><div class="dmgrid">{% for i in range(4) %}<div><label for="dm_{{ i }}">Mesaj {{ i+1 }}</label><textarea id="dm_{{ i }}" name="dm_{{ i }}" required maxlength="1000" rows="4" placeholder="Göndermek istediğin mesajı ve linkini yaz…">{{ edit.dm_variants[i] if edit else '' }}</textarea></div>{% endfor %}</div>
-<div class="step">04 · YORUM YANITLARI</div><label for="replies">Alternatif cevapların</label><textarea id="replies" name="replies" required rows="4" placeholder="Bilgileri DM’den ilettim, kontrol edebilirsin.&#10;Mesaj kutuna bir göz at!">{{ edit.reply_variants|join('\n') if edit else '' }}</textarea><small class="help">Her satıra bir yanıt, en az iki farklı seçenek. Yanıt yalnızca DM başarıyla gönderilirse yazılır.</small><hr class="divider"><button class="save">{{ 'Değişiklikleri kaydet' if edit else 'Otomasyonu kaydet' }}</button><p class="tiny">Yeni kurallar kaydedildiği andan sonraki yorumlarda çalışır.</p></form></section>
-<aside><section class="card"><h2>Video koleksiyonun</h2><p class="sub">Kurallarını düzenle, durdur veya yeniden başlat.</p>{% for mid,r in rules.items() %}<article class="video"><div class="videohead"><h3>{{ r.title or 'Reels videosu' }}</h3><span class="pill {{ 'green' if r.enabled else 'grey' }}">{{ 'Aktif' if r.enabled else 'Duraklatıldı' }}</span></div><p>{{ 'Yalnızca takipçiler' if r.get('follower_only', True) else 'Herkes' }} · {{ r.keywords|join(', ') or 'Bütün yeni yorumlar' }}</p>{% if r.permalink %}<a href="{{ r.permalink }}" target="_blank" rel="noopener noreferrer" class="tiny">Videoyu Instagram’da aç ↗</a>{% endif %}<div class="actions"><a class="button ghost" href="{{ url_for('index', edit=mid) }}">Düzenle</a><form method="post" action="{{ url_for('toggle_rule') }}"><input type="hidden" name="csrf" value="{{ session.csrf }}"><input type="hidden" name="media_id" value="{{ mid }}"><button class="ghost">{{ 'Durdur' if r.enabled else 'Başlat' }}</button></form><form method="post" action="{{ url_for('delete_rule') }}"><input type="hidden" name="csrf" value="{{ session.csrf }}"><input type="hidden" name="media_id" value="{{ mid }}"><button class="danger">Sil</button></form></div></article>{% else %}<div class="empty"><b>İlk videonla başla</b>Reels linkini soldaki forma yapıştır.<br>Kaydettiğin videolar burada görünecek.</div>{% endfor %}</section>
-<section class="card"><div class="videohead"><h2>Son işlemler</h2><a class="tiny" href="{{ url_for('index') }}">Yenile ↻</a></div><p class="sub">Gönderimleri ve takip kontrollerini buradan izle.</p><div class="logs">{% for e in events %}<div class="log">{{ e }}</div>{% else %}<div class="empty">Henüz bir işlem kaydı yok.</div>{% endfor %}</div><p class="tiny">Bu süreçteki son kayıtlar gösterilir. Kalıcı gönderim geçmişi Firebase’de tutulur.</p></section></aside></div><footer>LGSHocam Stüdyo · Her uygun yorum için bir DM ve bir yorum yanıtı</footer></main></body></html>
+<div class="step">03 · MESAJ PLANI</div><label for="message_mode">Mesaj düzeni</label><select id="message_mode" name="message_mode" onchange="switchMode()"><option value="single" {% if not edit or not edit.get('plans') %}selected{% endif %}>Tek kural · 4 farklı DM alternatifi</option><option value="plans" {% if edit and edit.get('plans') %}selected{% endif %}>Yoruma göre · En fazla 6 ayrı plan</option></select>
+<div id="plans" {% if not edit or not edit.get('plans') %}hidden{% endif %}><p class="sub">“5” yazana başka, “6” yazana başka mesaj. Yorumun tamamı eşleşir; “15”, “5” planını tetiklemez. Kullanmadığın planları boş bırak.</p>{% for i in range(6) %}{% set plan = edit.get('plans', [])[i] if edit and edit.get('plans') and i < edit.get('plans')|length else none %}<div style="background:#fafbfe;border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px"><h3>Plan {{ i+1 }}</h3><label>Yorum tam olarak ne olsun?</label><input name="plan_trigger_{{ i }}" maxlength="100" placeholder="Örnek: {{ i+5 }}" value="{{ plan.trigger if plan else '' }}"><label>Bu yoruma gönderilecek DM</label><textarea name="plan_dm_{{ i }}" maxlength="1000" rows="3" placeholder="Bu plana özel mesajın ve linkin…">{{ plan.dm_variants|join(' --- ') if plan else '' }}</textarea><label>Yorum altına yanıt</label><textarea name="plan_reply_{{ i }}" maxlength="1000" rows="2" placeholder="DM’den gönderdim! --- Mesaj kutunu kontrol et.">{{ plan.reply_variants|join(' --- ') if plan else '' }}</textarea><small class="help">İstersen DM ve yorum yanıtı alternatiflerini --- ile ayır. Her yorum için biri seçilir.</small></div>{% endfor %}</div><div id="single" {% if edit and edit.get('plans') %}hidden{% endif %}><label for="keywords">Hangi yorumlar tetiklesin?</label><textarea id="keywords" name="keywords" rows="2" placeholder="MATEMATİK&#10;NOTLAR">{{ edit.keywords|join('\n') if edit else '' }}</textarea><small class="help">Her satıra bir anahtar kelime. Boşsa bütün yeni yorumlar.</small>
+<div class="step">03 · DM MESAJLARI</div><p class="sub">Dört farklı metin hazırla. Her yorumda bunlardan biri rastgele seçilir.</p><div class="dmgrid">{% for i in range(4) %}<div><label for="dm_{{ i }}">Mesaj {{ i+1 }}</label><textarea id="dm_{{ i }}" name="dm_{{ i }}" required maxlength="1000" rows="4" placeholder="Göndermek istediğin mesajı ve linkini yaz…">{{ edit.dm_variants[i] if edit and i < edit.dm_variants|length else '' }}</textarea></div>{% endfor %}</div>
+<div class="step">04 · YORUM YANITLARI</div><label for="replies">Alternatif cevapların</label><textarea id="replies" name="replies" required rows="4" placeholder="Bilgileri DM’den ilettim, kontrol edebilirsin.&#10;Mesaj kutuna bir göz at!">{{ edit.reply_variants|join('\n') if edit else '' }}</textarea><small class="help">Her satıra bir yanıt, en az iki farklı seçenek. Yanıt yalnızca DM başarıyla gönderilirse yazılır.</small></div><script>function switchMode(){const plans=document.getElementById('message_mode').value==='plans';document.getElementById('plans').hidden=!plans;document.getElementById('single').hidden=plans;document.querySelectorAll('#single textarea').forEach(el=>{el.required=!plans && el.name!=='keywords';el.disabled=plans});document.querySelectorAll('#plans input,#plans textarea').forEach(el=>el.disabled=!plans)}switchMode();</script><hr class="divider"><button class="save">{{ 'Değişiklikleri kaydet' if edit else 'Otomasyonu kaydet' }}</button><p class="tiny">Yeni kurallar kaydedildiği andan sonraki yorumlarda çalışır.</p></form></section>
+<aside><section class="card"><h2>Video koleksiyonun</h2><p class="sub">Kurallarını düzenle, durdur veya yeniden başlat.</p>{% for mid,r in rules.items() %}<article class="video"><div class="videohead"><h3>{{ r.title or 'Reels videosu' }}</h3><span class="pill {{ 'green' if r.enabled else 'grey' }}">{{ 'Aktif' if r.enabled else 'Duraklatıldı' }}</span></div><p>{{ 'Yalnızca takipçiler' if r.get('follower_only', True) else 'Herkes' }} · {{ r.plans|map(attribute='trigger')|join(' · ') if r.get('plans') else (r.keywords|join(', ') or 'Bütün yeni yorumlar') }}</p>{% if r.permalink %}<a href="{{ r.permalink }}" target="_blank" rel="noopener noreferrer" class="tiny">Videoyu Instagram’da aç ↗</a>{% endif %}<div class="actions"><a class="button ghost" href="{{ url_for('index', edit=mid) }}">Düzenle</a><form method="post" action="{{ url_for('toggle_rule') }}"><input type="hidden" name="csrf" value="{{ session.csrf }}"><input type="hidden" name="media_id" value="{{ mid }}"><button class="ghost">{{ 'Durdur' if r.enabled else 'Başlat' }}</button></form><form method="post" action="{{ url_for('delete_rule') }}"><input type="hidden" name="csrf" value="{{ session.csrf }}"><input type="hidden" name="media_id" value="{{ mid }}"><button class="danger">Sil</button></form></div></article>{% else %}<div class="empty"><b>İlk videonla başla</b>Reels linkini soldaki forma yapıştır.<br>Kaydettiğin videolar burada görünecek.</div>{% endfor %}</section>
+<section class="card"><div class="videohead"><h2>Son işlemler</h2><a class="tiny" href="{{ url_for('index', refresh='1') }}">Yenile ↻</a></div><p class="sub">Gönderimleri ve takip kontrollerini buradan izle.</p><div class="logs">{% for e in events %}<div class="log">{{ e }}</div>{% else %}<div class="empty">Henüz bir işlem kaydı yok.</div>{% endfor %}</div><p class="tiny">Bu süreçteki son kayıtlar gösterilir. Kalıcı gönderim geçmişi Firebase’de tutulur.</p></section></aside></div><footer>LGSHocam Stüdyo · Her uygun yorum için bir DM ve bir yorum yanıtı</footer></main></body></html>
 '''
+
+
+PANEL_CACHE_LOCK = threading.Lock()
+PANEL_CACHE = {'rules': {}, 'media': [], 'media_error': '', 'rules_error': '',
+               'updated_at': 0, 'loading': False, 'media_ready': False}
+
+
+def refresh_panel_cache():
+    """HTTP sayfa isteğinden bağımsız yükler; aynı anda tek yenileme."""
+    try:
+        try:
+            saved = rules()
+            with PANEL_CACHE_LOCK:
+                PANEL_CACHE.update(rules=saved, rules_error='')
+        except ServiceError as exc:
+            with PANEL_CACHE_LOCK:
+                PANEL_CACHE['rules_error'] = str(exc)
+        try:
+            media = list(account_reels())
+            with PANEL_CACHE_LOCK:
+                PANEL_CACHE.update(media=media, media_error='' if media else media_diagnostic(), media_ready=True)
+        except ServiceError as exc:
+            with PANEL_CACHE_LOCK:
+                PANEL_CACHE.update(media_error=media_diagnostic(exc), media_ready=False)
+    except Exception as exc:
+        with PANEL_CACHE_LOCK:
+            PANEL_CACHE['media_error'] = 'Liste yükleme hatası: ' + type(exc).__name__
+    finally:
+        with PANEL_CACHE_LOCK:
+            PANEL_CACHE.update(loading=False, updated_at=time.time())
+
+
+def start_panel_refresh(force=False):
+    with PANEL_CACHE_LOCK:
+        if PANEL_CACHE['loading'] or (not force and time.time() - PANEL_CACHE['updated_at'] < 60):
+            return
+        PANEL_CACHE['loading'] = True
+    threading.Thread(target=refresh_panel_cache, daemon=True).start()
+
+
+def update_cached_rule(mid, item):
+    with PANEL_CACHE_LOCK:
+        if item is None:
+            PANEL_CACHE['rules'].pop(mid, None)
+        else:
+            PANEL_CACHE['rules'][mid] = dict(item)
+        PANEL_CACHE['updated_at'] = 0
 
 
 @app.get('/')
 def index():
-    try:
-        saved = rules()
-    except ServiceError as exc:
-        return str(exc), 503
-    media, error = [], ''
-    try:
-        media = list(account_reels())
-        if not media:
-            error = media_diagnostic()
-    except ServiceError as exc:
-        error = media_diagnostic(exc)
+    start_panel_refresh(force=request.args.get('refresh') == '1')
+    with PANEL_CACHE_LOCK:
+        saved = dict(PANEL_CACHE['rules'])
+        media = list(PANEL_CACHE['media'])
+        error = PANEL_CACHE['media_error']
+        rules_error = PANEL_CACHE['rules_error']
+        loading = PANEL_CACHE['loading']
     edit = saved.get(request.args.get('edit'))
     with EVENT_LOCK:
         entries = list(EVENTS)
     return render_template_string(HTML, rules=saved, media=media, edit=edit,
-                                  media_error=error, events=entries)
+                                  media_error=error, rules_error=rules_error, loading=loading, events=entries)
 
 
 @app.post('/save')
@@ -350,10 +417,26 @@ def save_rule():
     if not link and not mid.isdigit():
         flash('Reels bağlantısı yapıştırın veya listeden video seçin.')
         return redirect(url_for('index'))
+    plans = []
+    mode = request.form.get('message_mode', 'single')
+    if mode == 'plans':
+        for i in range(6):
+            trigger = request.form.get(f'plan_trigger_{i}', '').strip()
+            dm = request.form.get(f'plan_dm_{i}', '').strip()
+            reply = request.form.get(f'plan_reply_{i}', '').strip()
+            if not any((trigger, dm, reply)):
+                continue
+            if not all((trigger, dm, reply)) or len(trigger)>100 or len(dm)>1000 or len(reply)>1000:
+                flash('Her plan için yorum, DM ve yorum yanıtı dolu olmalı. Mesajlar en fazla 1000 karakter.')
+                return redirect(url_for('index', edit=mid))
+            plans.append({'trigger': trigger, 'dm_variants': [x.strip() for x in dm.split('---') if x.strip()], 'reply_variants': [x.strip() for x in reply.split('---') if x.strip()]})
+        if not plans or any(not p['dm_variants'] or not p['reply_variants'] for p in plans) or len({normalized(p['trigger']) for p in plans}) != len(plans):
+            flash('En az bir dolu plan ekleyin; yorum tetikleyicileri farklı olmalı.')
+            return redirect(url_for('index', edit=mid))
     dms = [request.form.get(f'dm_{i}', '').strip() for i in range(4)]
     replies = list(dict.fromkeys(x.strip() for x in request.form.get('replies', '').splitlines() if x.strip()))
     keywords = list(dict.fromkeys(x.strip() for x in request.form.get('keywords', '').splitlines() if x.strip()))
-    if any(not x or len(x) > 1000 for x in dms) or len(set(dms)) != 4 or len(replies) < 2 or any(len(x) > 1000 for x in replies):
+    if mode != 'plans' and (any(not x or len(x) > 1000 for x in dms) or len(set(dms)) != 4 or len(replies) < 2 or any(len(x) > 1000 for x in replies)):
         flash('Dört farklı ve dolu DM seçeneği, en az iki farklı yorum yanıtı gerekli. Her metin en fazla 1000 karakter.')
         return redirect(url_for('index', edit=mid))
     try:
@@ -376,11 +459,16 @@ def save_rule():
             return redirect(url_for('index'))
         mid = str(media['id'])
         old = cloud('GET', 'automation_v2/rules/' + mid)[0] or {}
-        cloud('PUT', 'automation_v2/rules/' + mid, {'media_id': mid, 'title': media.get('caption', '')[:100],
-              'keywords': keywords, 'dm_variants': dms, 'reply_variants': replies,
+        old_plans = {normalized(p['trigger']):p for p in old.get('plans', [])}
+        for plan in plans:
+            plan['created_at'] = old_plans.get(normalized(plan['trigger']), {}).get('created_at', time.time())
+        item = {'media_id': mid, 'title': media.get('caption', '')[:100],
+              'keywords': keywords if not plans else [], 'dm_variants': dms if not plans else [], 'reply_variants': replies if not plans else [], 'plans': plans,
               'permalink': media.get('permalink', ''),
               'follower_only': request.form.get('audience', 'followers') != 'everyone',
-              'created_at': old.get('created_at', time.time()), 'enabled': old.get('enabled', True)})
+              'created_at': old.get('created_at', time.time()), 'enabled': old.get('enabled', True)}
+        cloud('PUT', 'automation_v2/rules/' + mid, item)
+        update_cached_rule(mid, item)
         flash('Video kuralı kaydedildi.')
     except ServiceError as exc:
         flash(str(exc))
@@ -396,7 +484,9 @@ def toggle_rule():
         path = 'automation_v2/rules/' + mid
         item = cloud('GET', path)[0]
         if item:
-            cloud('PATCH', path, {'enabled': not item.get('enabled', False)})
+            item['enabled'] = not item.get('enabled', False)
+            cloud('PATCH', path, {'enabled': item['enabled']})
+            update_cached_rule(mid, item)
     except ServiceError as exc:
         flash(str(exc))
     return redirect(url_for('index'))
@@ -409,6 +499,7 @@ def delete_rule():
         abort(400)
     try:
         cloud('DELETE', 'automation_v2/rules/' + mid)
+        update_cached_rule(mid, None)
         flash('Video kuralı silindi; gönderim geçmişi korundu.')
     except ServiceError as exc:
         flash(str(exc))
