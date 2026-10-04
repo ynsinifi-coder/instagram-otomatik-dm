@@ -3,8 +3,6 @@ import json
 import re
 import requests
 import random
-import string
-import secrets
 import uuid
 import time
 import threading
@@ -32,7 +30,7 @@ PROCESSED_FILE = "processed_comments.json"
 
 
 # =========================================================
-# CONFIG OKUMA / KAYDETME (ÇOKLU KURAL İÇİN GÜNCELLENDİ)
+# CONFIG OKUMA / KAYDETME
 # =========================================================
 
 def load_config():
@@ -46,7 +44,6 @@ def load_config():
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
             
-            # Eski tekil sistemden yeni çoklu kural sistemine geçiş (Migration)
             if "rules" not in saved:
                 if saved.get("reel_id"):
                     default_config["rules"].append({
@@ -54,10 +51,8 @@ def load_config():
                         "reel_url": saved.get("reel_url", ""),
                         "reel_id": saved.get("reel_id", ""),
                         "keyword": saved.get("keyword", "bilgi"),
-                        "message": saved.get("message", ""),
-                        "reply_1": saved.get("reply_1", ""),
-                        "reply_2": saved.get("reply_2", ""),
-                        "reply_3": saved.get("reply_3", "")
+                        "follower_only": True,
+                        "dm_1": saved.get("message", ""),
                     })
                 default_config["enabled"] = saved.get("enabled", True)
             else:
@@ -104,6 +99,24 @@ def save_processed_comments(comments):
             )
     except Exception as e:
         print("İŞLENMİŞ YORUMLAR KAYDETME HATASI:", e)
+
+
+# =========================================================
+# TAKİPÇİ KONTROLÜ
+# =========================================================
+
+def check_if_following(user_id):
+    try:
+        url = f"https://graph.facebook.com/{API_VERSION}/{IG_USER_ID}/followers"
+        params = {"access_token": ACCESS_TOKEN}
+        res = requests.get(url, params=params).json()
+        followers = res.get("data", [])
+        for follower in followers:
+            if str(follower.get("id")) == str(user_id):
+                return True
+    except Exception as e:
+        print(f"Takipçi kontrol hatası: {e}")
+    return True # Hata durumunda akışın kesilmemesi için
 
 
 # =========================================================
@@ -186,7 +199,7 @@ def home():
 
 
 # =========================================================
-# YÖNETİM PANELİ (ÇOKLU KURAL & SPINTAX)
+# YÖNETİM PANELİ
 # =========================================================
 
 @app.route("/panel", methods=["GET", "POST"])
@@ -199,6 +212,7 @@ def panel():
         reel_url = request.form.get("reel_url", "").strip()
         keyword = request.form.get("keyword", "").strip()
         dm_1 = request.form.get("dm_1", "").strip()
+        follower_only = True if request.form.get("follower_only") else False
 
         if not reel_url or not keyword or not dm_1:
             message = "❌ Reel linki, kelime ve en azından 1. DM Mesajı alanı zorunludur."
@@ -214,6 +228,7 @@ def panel():
                     "reel_url": reel_url,
                     "reel_id": reel["media_id"],
                     "keyword": keyword.lower(),
+                    "follower_only": follower_only,
                     "dm_1": dm_1,
                     "dm_2": request.form.get("dm_2", "").strip(),
                     "dm_3": request.form.get("dm_3", "").strip(),
@@ -229,7 +244,7 @@ def panel():
                 config["rules"].append(new_rule)
                 save_config(config)
 
-                message = f"✅ Yeni rotasyonlu otomasyon kuralı başarıyla eklendi! (Kelime: {keyword})"
+                message = f"✅ Yeni otomasyon kuralı başarıyla eklendi! (Kelime: {keyword})"
                 message_type = "success"
 
     return render_template_string(
@@ -278,7 +293,7 @@ def verify_webhook():
 
 
 # =========================================================
-# WEBHOOK (15 Saniye Gecikmeli & Spintax Rotasyon)
+# WEBHOOK (15 Saniye Gecikmeli, Çoklu Kelime & Takipçi Filtresi)
 # =========================================================
 
 @app.route("/webhook", methods=["POST"])
@@ -306,37 +321,43 @@ def receive_webhook():
                 comment_id = value.get("id")
                 comment_text = value.get("text", "").lower()
                 media_id = value.get("media", {}).get("id") or value.get("media_id")
+                from_user = value.get("from", {})
+                user_id = from_user.get("id")
 
-                if not media_id or not comment_id:
+                if not media_id or not comment_id or not user_id:
                     continue
 
-                # Eğer daha önce işlendiyse atla
                 if comment_id in processed_comments:
                     continue
 
-                # Eşleşen kuralı ara
+                # Eşleşen kuralı ara (Virgülle ayrılmış anahtar kelimeleri destekler)
                 matched_rule = None
                 for rule in rules:
                     if str(rule.get("reel_id")) == str(media_id):
-                        if rule.get("keyword") in comment_text:
+                        keyword_group = rule.get("keyword", "")
+                        keywords = [kw.strip().lower() for kw in keyword_group.split(",")]
+                        matched = any(kw in comment_text for kw in keywords if kw)
+                        if matched:
                             matched_rule = rule
                             break 
                 
                 if not matched_rule:
                     continue 
 
-                print(f"✅ UYGUN YORUM BULUNDU! Kural Kelimesi: {matched_rule['keyword']}")
+                print(f"✅ UYGUN YORUM BULUNDU! Kural: {matched_rule['keyword']}")
                 
-                # Tekrar çalışmaması için anında işlenmiş yorumlara kaydediyoruz
                 processed_comments.add(comment_id)
                 save_processed_comments(processed_comments)
 
-                # --- 15 SANİYE GECİKME VE SPINTAX İŞLEMİ ---
-                def delayed_job(c_id, rule_data):
+                def delayed_job(c_id, u_id, rule_data):
                     print(f"⏳ [KUYRUK] Yorum algılandı. 15 saniye bekleniyor... (Yorum ID: {c_id})")
                     time.sleep(15)
                     
-                    # DM Rotasyonu Seçimi
+                    # Takipçi Filtresi Kontrolü
+                    if rule_data.get("follower_only", True) and not check_if_following(u_id):
+                        print(f"❌ [İPTAL] Kullanıcı sayfayı takip etmiyor. (User ID: {u_id})")
+                        return
+
                     dm_replies = []
                     if rule_data.get("dm_1"): dm_replies.append(rule_data["dm_1"])
                     if rule_data.get("dm_2"): dm_replies.append(rule_data["dm_2"])
@@ -344,9 +365,6 @@ def receive_webhook():
                     if rule_data.get("dm_4"): dm_replies.append(rule_data["dm_4"])
                     if rule_data.get("dm_5"): dm_replies.append(rule_data["dm_5"])
                     
-                    if not dm_replies and rule_data.get("message"):
-                        dm_replies.append(rule_data["message"])
-
                     chosen_dm = random.choice(dm_replies) if dm_replies else "Mesaj bulunamadı"
 
                     success = send_private_reply(c_id, chosen_dm)
@@ -365,7 +383,7 @@ def receive_webhook():
                             
                     print(f"✅ [BAŞARILI] İşlem tamamlandı. Yorum ID: {c_id}")
 
-                thread = threading.Thread(target=delayed_job, args=(comment_id, matched_rule))
+                thread = threading.Thread(target=delayed_job, args=(comment_id, user_id, matched_rule))
                 thread.daemon = True
                 thread.start()
 
@@ -462,7 +480,7 @@ PANEL_HTML = """
 <div class="container">
     <div class="header">
         <h1>🎓 LGS Hocam</h1>
-        <p>Gelişmiş Çoklu DM & Yorum Otomasyonu (Spintax Korumalı)</p>
+        <p>Gelişmiş Çoklu DM & Yorum Otomasyonu (Takipçi Filtreli)</p>
     </div>
 
     {% if message %}
@@ -501,13 +519,9 @@ PANEL_HTML = """
                 {% for rule in config.get("rules", []) %}
                 <div class="rule-item">
                     <div class="rule-details">
-                        <h4>Şart: <span class="badge">"{{ rule.keyword }}"</span> kelimesini yazanlar</h4>
+                        <h4>Şart: <span class="badge">"{{ rule.keyword }}"</span> kelimeleri</h4>
                         <p><b>Video:</b> <a href="{{ rule.reel_url }}" target="_blank" style="color: var(--primary);">{{ rule.reel_url[:45] }}...</a></p>
-                        <p><b>Örnek Mesaj:</b> 
-                        {% if rule.dm_1 %}{{ rule.dm_1[:60] }}...
-                        {% elif rule.message %}{{ rule.message[:60] }}...
-                        {% else %}Mesaj Belirsiz{% endif %}
-                        </p>
+                        <p><b>Sadece Takipçi:</b> {{ 'Evet' if rule.follower_only else 'Hayır' }}</p>
                     </div>
                     <form action="/delete_rule/{{ rule.id }}" method="POST" style="margin: 0;" onsubmit="return confirm('Bu kuralı silmek istediğinize emin misiniz?');">
                         <button type="submit" class="btn btn-danger">🗑️ Sil</button>
@@ -527,15 +541,18 @@ PANEL_HTML = """
             </div>
 
             <div class="form-group">
-                <label>🔑 Anahtar Kelime</label>
-                <span class="helper-text">Örn: 9. sınıf için "kamp", 7. sınıf için "not" yazabilirsiniz.</span>
-                <input type="text" name="keyword" placeholder="bilgi" required>
+                <label>🔑 Anahtar Kelimeler (Birden fazla için virgül kullanın)</label>
+                <span class="helper-text">Örn: mat, matematik, lgs</span>
+                <input type="text" name="keyword" placeholder="mat, matematik, lgs" required>
+            </div>
+
+            <div class="form-group">
+                <label><input type="checkbox" name="follower_only" value="1" checked> Sadece Takipçilere Gönder</label>
             </div>
 
             <div class="reply-box">
                 <h3 style="margin-top: 0; font-size: 15px;">📩 Rastgele Gidecek DM Mesajları (En az 1 tane zorunlu)</h3>
-                <span class="helper-text">Instagram botlarından kaçmak için mesajlarınızı çeşitlendirin.</span>
-                <textarea name="dm_1" placeholder="1. DM Alternatifi (Zorunlu) - Örn: Merhaba, işte kamp linki! 🚀" required></textarea>
+                <textarea name="dm_1" placeholder="1. DM Alternatifi (Zorunlu) - Örn: Merhaba, işte link! 🚀" required></textarea>
                 <textarea name="dm_2" placeholder="2. DM Alternatifi (Opsiyonel)"></textarea>
                 <textarea name="dm_3" placeholder="3. DM Alternatifi (Opsiyonel)"></textarea>
                 <textarea name="dm_4" placeholder="4. DM Alternatifi (Opsiyonel)"></textarea>
