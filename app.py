@@ -113,12 +113,11 @@ def background_bot_loop():
                         continue
                     
                     for keyword_group, content in rules.items():
-                        # Virgülle ayrılmış anahtar kelimeleri kontrol et
                         keywords = [kw.strip().lower() for kw in keyword_group.split(",")]
                         matched = any(kw in comment_text for kw in keywords if kw)
                         
                         if matched:
-                            time.sleep(15) # 15 saniye bekleme
+                            time.sleep(15)
                             
                             if content.get("follower_only", False) and not check_if_following(user_id):
                                 continue
@@ -163,7 +162,7 @@ HTML_TEMPLATE = """
 <body>
     <div class="container">
         <h2>@lgshocamm Otomasyon Paneli</h2>
-        <div class="cloud-info">☁️ Bulut Hafıza Aktif (Kurallarınız silinmez)</div>
+        <div class="cloud-info">☁️️ Bulut Hafıza Aktif (Kurallarınız silinmez)</div>
         
         <form method="POST" action="/add">
             <label>Anahtar Kelimeler (Birden fazla için virgül kullanın):</label>
