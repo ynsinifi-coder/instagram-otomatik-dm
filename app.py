@@ -15,7 +15,7 @@ app = Flask(__name__)
 # AYARLAR
 # =========================================================
 
-ACCESS_TOKEN = "EAAWm6lRuLYEBSgDuLrG0fhxBT08gHiTvgbzwhzSlZB7CAFg65Ne0r0x9MJZCLirCrvlSnMtiZCzExmZAe2JAg1r4SskL5MdD8AB3pLYJApNg0sroi30xlDpEf9ZBCuPrGq6f7FZClhaMkom3LnwEZBrTExI2D4obHYZCLYzj3bGBoBP6jAykmcs4DO9G8JW37s5USWIELCbZBxV0MiM9rW8EgUFPAB1DHVAZDZD"
+ACCESS_TOKEN = "EAAWm6lRuLYEBSpJAmjJIITSol19aTu9ZAF5SSajpiXzvpmZA6AMpx1iDZAJ17qbZCiYdMcltXfBpKEVgOca7bRzF5340z5k3cUZCrz7RaKKoCWZCnCP7CBcUiLc3XzHAChCYRlrFhWFHEWH7OjDCLur4oNoDkhwn97TgeyVVJcvFfpkqWPXyFnFpap8b0IO8ZArP4PvaeJCg16su0m7vssfofj2HNW6S417o3TO3l70J9nBlfPaaUswNFlFGZC8xhg5wuZCV88Qi8L53RS4TvBAZDZD"
 IG_USER_ID = "1590900252618113"
 
 VERIFY_TOKEN = os.getenv(
@@ -116,7 +116,7 @@ def check_if_following(user_id):
                 return True
     except Exception as e:
         print(f"Takipçi kontrol hatası: {e}")
-    return True # Hata durumunda akışın kesilmemesi için
+    return True 
 
 
 # =========================================================
@@ -330,7 +330,6 @@ def receive_webhook():
                 if comment_id in processed_comments:
                     continue
 
-                # Eşleşen kuralı ara (Virgülle ayrılmış anahtar kelimeleri destekler)
                 matched_rule = None
                 for rule in rules:
                     if str(rule.get("reel_id")) == str(media_id):
@@ -353,7 +352,6 @@ def receive_webhook():
                     print(f"⏳ [KUYRUK] Yorum algılandı. 15 saniye bekleniyor... (Yorum ID: {c_id})")
                     time.sleep(15)
                     
-                    # Takipçi Filtresi Kontrolü
                     if rule_data.get("follower_only", True) and not check_if_following(u_id):
                         print(f"❌ [İPTAL] Kullanıcı sayfayı takip etmiyor. (User ID: {u_id})")
                         return
