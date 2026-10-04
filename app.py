@@ -60,13 +60,10 @@ def validate_config():
 
 
 def graph(method, path, *, params=None, payload=None):
-    """Gönderimlerde otomatik HTTP tekrarı yok: timeout sonrası sonuç belirsizdir."""
     """Gönderimlerde otomatik tekrar yok; hata çıktısında token/yanıt gövdesi yok."""
     uncertain = ' Gönderim sonucu belirsiz olabilir; otomatik tekrar yapılmaz.' if method != 'GET' else ''
     try:
         res = requests.request(method, f'{GRAPH_HOST}/{API_VERSION}/{path}',
-            headers={'Authorization': 'Bearer ' + ACCESS_TOKEN}, params=params,
-            json=payload, timeout=(5, 25))
             headers={'Authorization': 'Bearer ' + ACCESS_TOKEN.strip()}, params=params,
             json=payload, timeout=(10, 45))
     except requests.RequestException as exc:
@@ -78,14 +75,11 @@ def graph(method, path, *, params=None, payload=None):
         raise ServiceError(hints.get(kind, 'Meta ağ isteği başarısız.') + ' Hata türü: ' + kind + '.' + uncertain) from None
     try:
         data = res.json()
-    except (requests.RequestException, ValueError):
-        raise ServiceError('Meta bağlantı hatası; gönderim yapıldıysa sonuç belirsiz olabilir.') from None
     except ValueError:
         raise ServiceError(f'Meta HTTP {res.status_code}: JSON olmayan yanıt döndü. ' +
                            ('İstek sınırı uygulanmış olabilir.' if res.status_code == 429 else 'Meta geçici hata veya erişim engeli döndürmüş olabilir.') + uncertain) from None
     if not res.ok or not isinstance(data, dict) or 'error' in data:
         error = data.get('error', {}) if isinstance(data, dict) else {}
-        raise ServiceError(f'Meta HTTP {res.status_code}, kod {error.get("code", "?")}, alt kod {error.get("error_subcode", "?")}')
         if not isinstance(error, dict):
             error = {}
         code = error.get('code', '?')
