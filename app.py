@@ -1,589 +1,364 @@
+"""Reels yorum otomasyonu. Kurulum için KURULUM.md dosyasını okuyun."""
+import argparse
+import hashlib
+import hmac
+import logging
 import os
-import json
-import re
-import requests
 import random
-import uuid
-import time
+import re
+import secrets
 import threading
+import time
+from collections import deque
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 
-from flask import Flask, request, render_template_string, redirect, jsonify
+import requests
+from flask import Flask, abort, flash, redirect, render_template_string, request, session, url_for
 
 app = Flask(__name__)
+app.secret_key = os.getenv('SECRET_KEY') or secrets.token_hex(32)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax',
+                  SESSION_COOKIE_SECURE=os.getenv('COOKIE_SECURE') == '1', MAX_CONTENT_LENGTH=65536)
+ACCESS_TOKEN = os.getenv('ACCESS_TOKEN', '')
+IG_USER_ID = os.getenv('IG_USER_ID', '')
+FIREBASE_URL = os.getenv('FIREBASE_URL', '').rstrip('/')
+FIREBASE_AUTH = os.getenv('FIREBASE_AUTH', '')
+API_VERSION = os.getenv('META_API_VERSION', '')
+LOGIN_TYPE = os.getenv('META_LOGIN_TYPE', 'facebook')
+GRAPH_HOST = 'https://graph.instagram.com' if LOGIN_TYPE == 'instagram' else 'https://graph.facebook.com'
+PANEL_USER = os.getenv('PANEL_USER', 'admin')
+PANEL_PASSWORD = os.getenv('PANEL_PASSWORD', '')
+POLL_SECONDS = max(15, int(os.getenv('POLL_SECONDS', '30')))
+SEND_DELAY = max(0, int(os.getenv('SEND_DELAY_SECONDS', '15')))
+STOP = threading.Event()
+EVENTS = deque(maxlen=50)
+EVENT_LOCK = threading.Lock()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-# =========================================================
-# AYARLAR
-# =========================================================
 
-ACCESS_TOKEN = "EAAWm6lRuLYEBSpJAmjJIITSol19aTu9ZAF5SSajpiXzvpmZA6AMpx1iDZAJ17qbZCiYdMcltXfBpKEVgOca7bRzF5340z5k3cUZCrz7RaKKoCWZCnCP7CBcUiLc3XzHAChCYRlrFhWFHEWH7OjDCLur4oNoDkhwn97TgeyVVJcvFfpkqWPXyFnFpap8b0IO8ZArP4PvaeJCg16su0m7vssfofj2HNW6S417o3TO3l70J9nBlfPaaUswNFlFGZC8xhg5wuZCV88Qi8L53RS4TvBAZDZD"
-IG_USER_ID = "1590900252618113"
-
-VERIFY_TOKEN = os.getenv(
-    "VERIFY_TOKEN",
-    "instagram_webhook_2026"
-)
-
-API_VERSION = "v26.0"
-
-CONFIG_FILE = "instagram_config.json"
-PROCESSED_FILE = "processed_comments.json"
+class ServiceError(Exception):
+    pass
 
 
-# =========================================================
-# CONFIG OKUMA / KAYDETME
-# =========================================================
+def event(message):
+    logging.info(message)
+    with EVENT_LOCK:
+        EVENTS.appendleft(time.strftime('%H:%M:%S') + ' — ' + message)
 
-def load_config():
-    default_config = {
-        "enabled": True,
-        "rules": []
-    }
 
+def validate_config():
+    missing = [name for name, value in [('ACCESS_TOKEN', ACCESS_TOKEN), ('IG_USER_ID', IG_USER_ID),
+               ('FIREBASE_URL', FIREBASE_URL), ('META_API_VERSION', API_VERSION),
+               ('PANEL_PASSWORD', PANEL_PASSWORD), ('SECRET_KEY', os.getenv('SECRET_KEY'))] if not value]
+    if missing:
+        raise SystemExit('Eksik ortam değişkenleri: ' + ', '.join(missing))
+    if LOGIN_TYPE not in ('facebook', 'instagram') or not re.fullmatch(r'v\d+\.\d+', API_VERSION):
+        raise SystemExit('META_LOGIN_TYPE veya META_API_VERSION geçersiz.')
+    if urlparse(FIREBASE_URL).scheme != 'https':
+        raise SystemExit('FIREBASE_URL HTTPS olmalı.')
+
+
+def graph(method, path, *, params=None, payload=None):
+    """Gönderimlerde otomatik HTTP tekrarı yok: timeout sonrası sonuç belirsizdir."""
     try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            
-            if "rules" not in saved:
-                if saved.get("reel_id"):
-                    default_config["rules"].append({
-                        "id": str(uuid.uuid4()),
-                        "reel_url": saved.get("reel_url", ""),
-                        "reel_id": saved.get("reel_id", ""),
-                        "keyword": saved.get("keyword", "bilgi"),
-                        "follower_only": True,
-                        "dm_1": saved.get("message", ""),
-                    })
-                default_config["enabled"] = saved.get("enabled", True)
-            else:
-                default_config = saved
-
-    except Exception as e:
-        print("CONFIG OKUMA HATASI:", e)
-
-    return default_config
+        res = requests.request(method, f'{GRAPH_HOST}/{API_VERSION}/{path}',
+            headers={'Authorization': 'Bearer ' + ACCESS_TOKEN}, params=params,
+            json=payload, timeout=(5, 25))
+        data = res.json()
+    except (requests.RequestException, ValueError):
+        raise ServiceError('Meta bağlantı hatası; gönderim yapıldıysa sonuç belirsiz olabilir.') from None
+    if not res.ok or not isinstance(data, dict) or 'error' in data:
+        error = data.get('error', {}) if isinstance(data, dict) else {}
+        raise ServiceError(f'Meta HTTP {res.status_code}, kod {error.get("code", "?")}, alt kod {error.get("error_subcode", "?")}')
+    return data
 
 
-def save_config(config):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(
-            config,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
+def pages(path, fields):
+    cursor = None
+    seen = set()
+    while True:
+        params = {'fields': fields, 'limit': 100}
+        if cursor:
+            params['after'] = cursor
+        data = graph('GET', path, params=params)
+        yield from data.get('data', [])
+        paging = data.get('paging', {})
+        cursor = paging.get('cursors', {}).get('after')
+        if not paging.get('next') or not cursor or cursor in seen:
+            break
+        seen.add(cursor)
 
 
-# =========================================================
-# İŞLENMİŞ YORUMLAR
-# =========================================================
-
-def load_processed_comments():
+def cloud(method, path, value=None, headers=None):
     try:
-        if os.path.exists(PROCESSED_FILE):
-            with open(PROCESSED_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
-    except Exception as e:
-        print("İŞLENMİŞ YORUMLAR OKUMA HATASI:", e)
-
-    return set()
-
-
-def save_processed_comments(comments):
-    try:
-        with open(PROCESSED_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                list(comments),
-                f,
-                ensure_ascii=False
-            )
-    except Exception as e:
-        print("İŞLENMİŞ YORUMLAR KAYDETME HATASI:", e)
+        res = requests.request(method, f'{FIREBASE_URL}/{path}.json',
+            params={'auth': FIREBASE_AUTH} if FIREBASE_AUTH else None,
+            json=value, headers=headers, timeout=(5, 20))
+        if res.status_code == 412:
+            return None, None, False
+        if not res.ok:
+            raise ServiceError(f'Firebase HTTP {res.status_code}; okuma/yazma başarısız.')
+        return res.json(), res.headers.get('ETag'), True
+    except (requests.RequestException, ValueError):
+        raise ServiceError('Firebase bağlantı hatası.') from None
 
 
-# =========================================================
-# TAKİPÇİ KONTROLÜ
-# =========================================================
-
-def check_if_following(user_id):
-    try:
-        url = f"https://graph.facebook.com/{API_VERSION}/{IG_USER_ID}/followers"
-        params = {"access_token": ACCESS_TOKEN}
-        res = requests.get(url, params=params).json()
-        followers = res.get("data", [])
-        for follower in followers:
-            if str(follower.get("id")) == str(user_id):
-                return True
-    except Exception as e:
-        print(f"Takipçi kontrol hatası: {e}")
-    return True 
+def rules():
+    data = cloud('GET', 'automation_v2/rules')[0] or {}
+    if not isinstance(data, dict):
+        raise ServiceError('Firebase kural biçimi geçersiz.')
+    return data
 
 
-# =========================================================
-# REEL SHORTCODE BULMA
-# =========================================================
+def normalized(text):
+    return text.replace('İ', 'i').replace('I', 'ı').casefold()
 
-def extract_shortcode(url):
-    if not url:
+
+def matches(text, keywords):
+    return not keywords or any(normalized(k) in normalized(text) for k in keywords)
+
+
+def follower_state(user_id):
+    if not user_id:
         return None
-    url = url.strip()
-    match = re.search(r"instagram\.com/(?:[^/]+/)?(?:reel|p|reels)/([^/?#]+)", url)
-    if match:
-        return match.group(1)
-    return None
+    try:
+        value = graph('GET', str(user_id), params={'fields': 'is_user_follow_business'}).get('is_user_follow_business')
+        return value if isinstance(value, bool) else None
+    except ServiceError:
+        return None
 
 
-# =========================================================
-# INSTAGRAM MEDYALARINI ARA
-# =========================================================
+def comment_time(comment):
+    try:
+        return datetime.fromisoformat(comment['timestamp'].replace('Z', '+00:00')).timestamp()
+    except (KeyError, ValueError, TypeError):
+        return None
 
-def find_reel_by_url(target_url):
-    if not ACCESS_TOKEN: return None, "INSTAGRAM_ACCESS_TOKEN eksik."
-    if not IG_USER_ID: return None, "IG_USER_ID eksik."
 
-    target_shortcode = extract_shortcode(target_url)
-    if not target_shortcode: return None, "Geçerli bir Instagram Reel linki girilmedi."
+def history_path(comment_id):
+    return 'automation_v2/history/' + hashlib.sha256(str(comment_id).encode()).hexdigest()
 
-    url = f"https://graph.instagram.com/{API_VERSION}/{IG_USER_ID}/media"
-    params = {"fields": "id,media_type,permalink,caption,shortcode", "limit": 100, "access_token": ACCESS_TOKEN}
 
-    page_count = 0
-    media_count = 0
+def process_comment(media_id, comment, rule):
+    cid = str(comment.get('id', ''))
+    author = str((comment.get('from') or {}).get('id', ''))
+    created = comment_time(comment)
+    now = time.time()
+    if not cid or author == IG_USER_ID or created is None:
+        return
+    if created < rule['created_at'] or now - created > 7 * 86400:
+        return
+    if not matches(comment.get('text', ''), rule.get('keywords', [])):
+        return
+    # Eski uygulamanın işlediği yorumlar tekrar gönderilmez.
+    if cloud('GET', 'history/' + cid)[0]:
+        return
+    path = history_path(cid)
+    previous, etag, _ = cloud('GET', path, headers={'X-Firebase-ETag': 'true'})
+    if previous and (previous.get('status') != 'blocked' or previous.get('retry_at', 0) > now):
+        return
+    state = {'comment_id': cid, 'media_id': media_id, 'status': 'checking',
+             'updated_at': now, 'dm_status': 'pending', 'reply_status': 'pending'}
+    # Firebase ETag rezervasyonu: bir yorumu yalnızca bir çalışan alabilir.
+    if not cloud('PUT', path, state, {'if-match': etag})[2]:
+        return
+    if STOP.wait(SEND_DELAY):
+        state.update(status='blocked', retry_at=0)
+        cloud('PUT', path, state)
+        return
+    # Kural kaldırılmışsa/durdurulmuşsa gecikmeden sonra gönderme.
+    current = cloud('GET', 'automation_v2/rules/' + media_id)[0]
+    if not current or not current.get('enabled'):
+        state.update(status='cancelled')
+        cloud('PUT', path, state)
+        return
+    rule = current
+    if created < rule['created_at'] or not matches(comment.get('text', ''), rule.get('keywords', [])):
+        state.update(status='cancelled')
+        cloud('PUT', path, state)
+        return
+    follows = follower_state(author)
+    if follows is not True:
+        state.update(status='blocked', retry_at=time.time() + 300,
+                     reason='Takip etmiyor' if follows is False else 'Takip durumu doğrulanamadı')
+        cloud('PUT', path, state)
+        event(f'Yorum {cid}: {state["reason"]}; DM ve yanıt gönderilmedi.')
+        return
+    state.update(dm_text=random.choice(rule['dm_variants']),
+                 reply_text=random.choice(rule['reply_variants']))
+    # Yan etkiden önce niyet kaydedilir. Belirsiz sonuç otomatik tekrarlanmaz.
+    state.update(status='sending', dm_status='sending')
+    cloud('PUT', path, state)
+    try:
+        result = graph('POST', IG_USER_ID + '/messages', payload={
+            'recipient': {'comment_id': cid}, 'message': {'text': state['dm_text']}})
+        if not result.get('message_id'):
+            raise ServiceError('Meta mesaj kimliği dönmedi; sonuç belirsiz.')
+        state.update(dm_status='sent', message_id=result['message_id'])
+        cloud('PUT', path, state)
+        state.update(reply_status='sending')
+        cloud('PUT', path, state)
+        result = graph('POST', cid + '/replies', payload={'message': state['reply_text']})
+        if not result.get('id'):
+            raise ServiceError('Meta yanıt kimliği dönmedi; sonuç belirsiz.')
+        state.update(status='done', reply_status='sent', reply_id=result['id'])
+        cloud('PUT', path, state)
+        event(f'Yorum {cid}: DM ve yorum yanıtı gönderildi.')
+    except ServiceError as exc:
+        state.update(status='review_required', reason=str(exc))
+        # Başarısızlık veya belirsizlik başarı olarak kaydedilmez.
+        cloud('PUT', path, state)
+        event(f'Yorum {cid}: kontrol gerekli — {exc}')
 
-    while url and page_count < 100:
-        page_count += 1
+
+def background_bot_loop():
+    event('Bot başladı. Yalnızca seçilen videolar ve doğrulanmış takipçiler işlenecek.')
+    while not STOP.is_set():
         try:
-            response = requests.get(url, params=params, timeout=20)
-        except Exception as e:
-            return None, f"Instagram API bağlantı hatası: {e}"
-
-        if response.status_code != 200: return None, response.text
-
-        data = response.json()
-        for media in data.get("data", []):
-            media_count += 1
-            shortcode = media.get("shortcode")
-            permalink = media.get("permalink", "")
-
-            if shortcode == target_shortcode or target_shortcode in permalink:
-                return {
-                    "media_id": media.get("id"),
-                    "permalink": permalink,
-                    "shortcode": shortcode,
-                }, None
-
-        next_url = data.get("paging", {}).get("next")
-        if next_url:
-            url = next_url
-            params = {}
-        else:
-            url = None
-
-    return None, f"Reel bulunamadı. Kontrol edilen: {media_count}"
-
-
-# =========================================================
-# ANA SAYFA
-# =========================================================
-
-@app.route("/", methods=["GET"])
-def home():
-    config = load_config()
-    rule_count = len(config.get("rules", []))
-    
-    return f"""
-    <h2>LGS Hocam Otomatik DM Sistemi aktif ✅</h2>
-    <p>Şu anda <b>{rule_count}</b> farklı video için kurallar devrede.</p>
-    <p><a href="/panel">Yönetim panelini aç</a></p>
-    """
-
-
-# =========================================================
-# YÖNETİM PANELİ
-# =========================================================
-
-@app.route("/panel", methods=["GET", "POST"])
-def panel():
-    config = load_config()
-    message = ""
-    message_type = ""
-
-    if request.method == "POST":
-        reel_url = request.form.get("reel_url", "").strip()
-        keyword = request.form.get("keyword", "").strip()
-        dm_1 = request.form.get("dm_1", "").strip()
-        follower_only = True if request.form.get("follower_only") else False
-
-        if not reel_url or not keyword or not dm_1:
-            message = "❌ Reel linki, kelime ve en azından 1. DM Mesajı alanı zorunludur."
-            message_type = "error"
-        else:
-            reel, error = find_reel_by_url(reel_url)
-            if error:
-                message = f"❌ Reel bulunamadı.<br>{error}"
-                message_type = "error"
-            else:
-                new_rule = {
-                    "id": str(uuid.uuid4()),
-                    "reel_url": reel_url,
-                    "reel_id": reel["media_id"],
-                    "keyword": keyword.lower(),
-                    "follower_only": follower_only,
-                    "dm_1": dm_1,
-                    "dm_2": request.form.get("dm_2", "").strip(),
-                    "dm_3": request.form.get("dm_3", "").strip(),
-                    "dm_4": request.form.get("dm_4", "").strip(),
-                    "dm_5": request.form.get("dm_5", "").strip(),
-                    "reply_1": request.form.get("reply_1", "").strip(),
-                    "reply_2": request.form.get("reply_2", "").strip(),
-                    "reply_3": request.form.get("reply_3", "").strip(),
-                    "reply_4": request.form.get("reply_4", "").strip(),
-                    "reply_5": request.form.get("reply_5", "").strip()
-                }
-                
-                config["rules"].append(new_rule)
-                save_config(config)
-
-                message = f"✅ Yeni otomasyon kuralı başarıyla eklendi! (Kelime: {keyword})"
-                message_type = "success"
-
-    return render_template_string(
-        PANEL_HTML,
-        config=config,
-        message=message,
-        message_type=message_type
-    )
-
-# =========================================================
-# KURAL SİLME
-# =========================================================
-
-@app.route("/delete_rule/<rule_id>", methods=["POST"])
-def delete_rule(rule_id):
-    config = load_config()
-    config["rules"] = [r for r in config["rules"] if r.get("id") != rule_id]
-    save_config(config)
-    return redirect("/panel")
-
-
-# =========================================================
-# OTOMASYONU BAŞLAT / DURDUR
-# =========================================================
-
-@app.route("/toggle", methods=["POST"])
-def toggle_automation():
-    config = load_config()
-    config["enabled"] = not bool(config.get("enabled", True))
-    save_config(config)
-    return redirect("/panel")
-
-
-# =========================================================
-# WEBHOOK DOĞRULAMA
-# =========================================================
-
-@app.route("/webhook", methods=["GET"])
-def verify_webhook():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        return challenge, 200
-    return "Verification failed", 403
-
-
-# =========================================================
-# WEBHOOK (15 Saniye Gecikmeli, Çoklu Kelime & Takipçi Filtresi)
-# =========================================================
-
-@app.route("/webhook", methods=["POST"])
-def receive_webhook():
-    data = request.get_json(silent=True) or {}
-    config = load_config()
-
-    if not config.get("enabled", True):
-        return "EVENT_RECEIVED", 200
-
-    rules = config.get("rules", [])
-    if not rules:
-        return "EVENT_RECEIVED", 200
-
-    processed_comments = load_processed_comments()
-
-    try:
-        for entry in data.get("entry", []):
-            for change in entry.get("changes", []):
-                
-                if change.get("field") != "comments":
+            for mid, rule in rules().items():
+                if not rule.get('enabled'):
                     continue
-
-                value = change.get("value", {})
-                comment_id = value.get("id")
-                comment_text = value.get("text", "").lower()
-                media_id = value.get("media", {}).get("id") or value.get("media_id")
-                from_user = value.get("from", {})
-                user_id = from_user.get("id")
-
-                if not media_id or not comment_id or not user_id:
-                    continue
-
-                if comment_id in processed_comments:
-                    continue
-
-                matched_rule = None
-                for rule in rules:
-                    if str(rule.get("reel_id")) == str(media_id):
-                        keyword_group = rule.get("keyword", "")
-                        keywords = [kw.strip().lower() for kw in keyword_group.split(",")]
-                        matched = any(kw in comment_text for kw in keywords if kw)
-                        if matched:
-                            matched_rule = rule
-                            break 
-                
-                if not matched_rule:
-                    continue 
-
-                print(f"✅ UYGUN YORUM BULUNDU! Kural: {matched_rule['keyword']}")
-                
-                processed_comments.add(comment_id)
-                save_processed_comments(processed_comments)
-
-                def delayed_job(c_id, u_id, rule_data):
-                    print(f"⏳ [KUYRUK] Yorum algılandı. 15 saniye bekleniyor... (Yorum ID: {c_id})")
-                    time.sleep(15)
-                    
-                    if rule_data.get("follower_only", True) and not check_if_following(u_id):
-                        print(f"❌ [İPTAL] Kullanıcı sayfayı takip etmiyor. (User ID: {u_id})")
-                        return
-
-                    dm_replies = []
-                    if rule_data.get("dm_1"): dm_replies.append(rule_data["dm_1"])
-                    if rule_data.get("dm_2"): dm_replies.append(rule_data["dm_2"])
-                    if rule_data.get("dm_3"): dm_replies.append(rule_data["dm_3"])
-                    if rule_data.get("dm_4"): dm_replies.append(rule_data["dm_4"])
-                    if rule_data.get("dm_5"): dm_replies.append(rule_data["dm_5"])
-                    
-                    chosen_dm = random.choice(dm_replies) if dm_replies else "Mesaj bulunamadı"
-
-                    success = send_private_reply(c_id, chosen_dm)
-                    
-                    if success:
-                        replies = []
-                        if rule_data.get("reply_1"): replies.append(rule_data["reply_1"])
-                        if rule_data.get("reply_2"): replies.append(rule_data["reply_2"])
-                        if rule_data.get("reply_3"): replies.append(rule_data["reply_3"])
-                        if rule_data.get("reply_4"): replies.append(rule_data["reply_4"])
-                        if rule_data.get("reply_5"): replies.append(rule_data["reply_5"])
-
-                        if replies:
-                            chosen_reply = random.choice(replies)
-                            reply_to_comment(c_id, chosen_reply)
-                            
-                    print(f"✅ [BAŞARILI] İşlem tamamlandı. Yorum ID: {c_id}")
-
-                thread = threading.Thread(target=delayed_job, args=(comment_id, user_id, matched_rule))
-                thread.daemon = True
-                thread.start()
-
-    except Exception as e:
-        print("WEBHOOK HATASI:", e)
-
-    return "EVENT_RECEIVED", 200
+                try:
+                    for comment in pages(mid + '/comments', 'id,text,timestamp,from'):
+                        if STOP.is_set():
+                            return
+                        process_comment(mid, comment, rule)
+                except ServiceError as exc:
+                    event(f'Video {mid}: {exc}')
+        except ServiceError as exc:
+            event(str(exc))
+        except Exception as exc:
+            # Exception metni URL/token içerebilir; yalnızca türü yazılır.
+            event('Bot hatası: ' + type(exc).__name__)
+        STOP.wait(POLL_SECONDS)
 
 
-# =========================================================
-# YORUMA HERKESE AÇIK CEVAP YAZ
-# =========================================================
+@app.before_request
+def protect_panel():
+    auth = request.authorization
+    if not PANEL_PASSWORD or not auth or not (
+        hmac.compare_digest((auth.username or '').encode(), PANEL_USER.encode()) and
+        hmac.compare_digest((auth.password or '').encode(), PANEL_PASSWORD.encode())):
+        return 'Panel için giriş gerekli.', 401, {'WWW-Authenticate': 'Basic realm="Reels Panel"'}
+    session.setdefault('csrf', secrets.token_urlsafe(32))
+    if request.method == 'POST' and not hmac.compare_digest(request.form.get('csrf', ''), session['csrf']):
+        abort(403)
 
-def reply_to_comment(comment_id, reply_text):
-    if not ACCESS_TOKEN: return False
-    url = f"https://graph.instagram.com/{API_VERSION}/{comment_id}/replies"
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+
+HTML = '''<!doctype html><html lang="tr"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Reels Otomasyonu</title>
+<style>body{font-family:system-ui;background:#f3f5fa;color:#202b42;margin:0;padding:24px}main{max-width:900px;margin:auto}section{background:white;padding:24px;border-radius:14px;margin:20px 0}input,textarea,select{box-sizing:border-box;width:100%;padding:10px;margin:8px 0 16px;border:1px solid #bdc6d6;border-radius:6px}button{background:#315ae8;color:white;padding:10px 18px;border:0;border-radius:6px;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}a{color:#315ae8}.note{background:#fff1cc;padding:14px}.inline{display:inline-block;margin:6px}label{display:block}small{display:block;color:#536077} .flash{padding:12px;background:#e5ecff}</style>
+<main><h1>Reels yorum → DM paneli</h1>
+<p class="note">Yalnızca takip ettiği API ile doğrulanan kişilere gönderilir. Takip durumu okunamayan takipçiler de atlanır. Her yorum için dört DM seçeneğinden biri ve bir yorum yanıtı seçilir.</p>
+{% for msg in get_flashed_messages() %}<p class="flash">{{ msg }}</p>{% endfor %}
+<section><h2>{{ 'Kuralı düzenle' if edit else 'Video ekle' }}</h2>
+{% if media_error %}<p>{{ media_error }} Video ID’sini elle girebilirsiniz.</p>{% endif %}
+<form action="{{ url_for('save_rule') }}" method="post"><input type="hidden" name="csrf" value="{{ session.csrf }}">
+{% if edit %}<input type="hidden" name="media_id" value="{{ edit.media_id }}"><p>Video ID: {{ edit.media_id }}</p>
+{% else %}<label>Hesabınızdaki Reels</label><select name="selected_media"><option value="">Bir video seçin veya ID girin</option>{% for m in media %}<option value="{{ m.id }}">{{ (m.caption or 'Başlıksız')[:90] }} — {{ m.id }}</option>{% endfor %}</select>
+<label>Veya Instagram medya ID’si (Reels bağlantısındaki kısa kod değildir)</label><input name="media_id" pattern="[0-9]+" placeholder="Örnek: 18012345678901234">{% endif %}
+<label>Anahtar kelimeler (her satıra bir tane; boş bırakırsanız bütün yeni yorumlar)</label><textarea name="keywords" rows="3">{{ edit.keywords|join('\n') if edit else '' }}</textarea>
+{% for i in range(4) %}<label>DM seçeneği {{ i+1 }}</label><textarea name="dm_{{ i }}" required maxlength="1000" rows="2">{{ edit.dm_variants[i] if edit else '' }}</textarea>{% endfor %}
+<label>Yorum yanıtları (her satıra bir alternatif; en az iki farklı yanıt)</label><textarea name="replies" required rows="4">{{ edit.reply_variants|join('\n') if edit else '' }}</textarea>
+<small>Örnek: “Bilgileri DM’den ilettim.” ve “Mesaj kutunu kontrol edebilirsin.” Yanıt yalnızca DM başarıyla gönderildikten sonra yazılır.</small><p>Takipçi filtresi her zaman açık. Yeni kural, kaydedildiği andan sonraki yorumlarda çalışır.</p><button>Kaydet</button></form></section>
+<section><h2>Eklenen videolar</h2>{% for mid,r in rules.items() %}<article><h3>{{ r.title or mid }}</h3><p>Video ID: {{ mid }} · {{ 'Aktif' if r.enabled else 'Durduruldu' }}</p><p>Anahtar kelimeler: {{ r.keywords|join(', ') or 'Bütün yeni yorumlar' }}</p>
+<a href="{{ url_for('index', edit=mid) }}">Düzenle</a>
+<form class="inline" method="post" action="{{ url_for('toggle_rule') }}"><input type="hidden" name="csrf" value="{{ session.csrf }}"><input type="hidden" name="media_id" value="{{ mid }}"><button>{{ 'Durdur' if r.enabled else 'Başlat' }}</button></form>
+<form class="inline" method="post" action="{{ url_for('delete_rule') }}"><input type="hidden" name="csrf" value="{{ session.csrf }}"><input type="hidden" name="media_id" value="{{ mid }}"><button>Sil</button></form></article>{% else %}<p>Henüz video eklenmedi.</p>{% endfor %}</section>
+<section><h2>Son işlemler</h2><p>Firebase: automation_v2/history altında kalıcı gönderim durumları tutulur. Aşağıdaki liste bu sürecin son kayıtlarıdır; sayfayı yenileyin.</p>{% for e in events %}<pre>{{ e }}</pre>{% else %}<p>Bu süreçte kayıt yok. Ayrı bot çalışanının kayıtları terminalinde görünür.</p>{% endfor %}</section></main></html>'''
+
+
+@app.get('/')
+def index():
     try:
-        response = requests.post(url, headers=headers, json={"message": reply_text}, timeout=20)
-        return response.status_code in (200, 201)
-    except:
-        return False
-
-
-# =========================================================
-# DM GÖNDER
-# =========================================================
-
-def send_private_reply(comment_id, message_text):
-    if not ACCESS_TOKEN or not IG_USER_ID: return False
-    url = f"https://graph.instagram.com/{API_VERSION}/{IG_USER_ID}/messages"
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
-    payload = {"recipient": {"comment_id": comment_id}, "message": {"text": message_text}}
+        saved = rules()
+    except ServiceError as exc:
+        return str(exc), 503
+    media, error = [], ''
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=20)
-        return response.status_code in (200, 201)
-    except:
-        return False
+        media = [m for m in pages(IG_USER_ID + '/media', 'id,caption,media_product_type,permalink')
+                 if m.get('media_product_type') == 'REELS']
+    except ServiceError as exc:
+        error = str(exc)
+    edit = saved.get(request.args.get('edit'))
+    with EVENT_LOCK:
+        entries = list(EVENTS)
+    return render_template_string(HTML, rules=saved, media=media, edit=edit,
+                                  media_error=error, events=entries)
 
 
-# =========================================================
-# PANEL HTML ARAYÜZÜ
-# =========================================================
+@app.post('/save')
+def save_rule():
+    mid = (request.form.get('media_id') or request.form.get('selected_media') or '').strip()
+    if not mid.isdigit():
+        flash('Geçerli bir medya ID’si girin veya video seçin.')
+        return redirect(url_for('index'))
+    dms = [request.form.get(f'dm_{i}', '').strip() for i in range(4)]
+    replies = list(dict.fromkeys(x.strip() for x in request.form.get('replies', '').splitlines() if x.strip()))
+    keywords = list(dict.fromkeys(x.strip() for x in request.form.get('keywords', '').splitlines() if x.strip()))
+    if any(not x or len(x) > 1000 for x in dms) or len(set(dms)) != 4 or len(replies) < 2 or any(len(x) > 1000 for x in replies):
+        flash('Dört farklı ve dolu DM seçeneği, en az iki farklı yorum yanıtı gerekli. Her metin en fazla 1000 karakter.')
+        return redirect(url_for('index', edit=mid))
+    try:
+        # Yalnızca hesaba ait Reels seçilmesine izin verilir.
+        media = next((m for m in pages(IG_USER_ID + '/media', 'id,caption,media_product_type') if str(m['id']) == mid), None)
+        if not media or media.get('media_product_type') != 'REELS':
+            flash('Bu ID hesabınızda erişilebilen bir Reels videosuna ait değil.')
+            return redirect(url_for('index'))
+        old = cloud('GET', 'automation_v2/rules/' + mid)[0] or {}
+        cloud('PUT', 'automation_v2/rules/' + mid, {'media_id': mid, 'title': media.get('caption', '')[:100],
+              'keywords': keywords, 'dm_variants': dms, 'reply_variants': replies,
+              'created_at': old.get('created_at', time.time()), 'enabled': old.get('enabled', True)})
+        flash('Video kuralı kaydedildi.')
+    except ServiceError as exc:
+        flash(str(exc))
+    return redirect(url_for('index'))
 
-PANEL_HTML = """
-<!DOCTYPE html>
-<html lang="tr">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LGS Hocam - Gelişmiş Otomasyon Paneli</title>
-    <style>
-        :root { --primary: #4F46E5; --primary-hover: #4338CA; --bg-color: #F3F4F6; --card-bg: #FFFFFF; --text-main: #1F2937; --text-muted: #6B7280; --border-color: #E5E7EB; }
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: var(--bg-color); color: var(--text-main); margin: 0; padding: 40px 20px; display: flex; justify-content: center; }
-        .container { max-width: 900px; width: 100%; }
-        .header { text-align: center; margin-bottom: 30px; }
-        .header h1 { color: var(--primary); font-size: 28px; margin: 0; }
-        .card { background: var(--card-bg); border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.05); padding: 30px; margin-bottom: 25px; }
-        
-        .status-box { display: flex; align-items: center; justify-content: space-between; padding: 20px; border-radius: 12px; background: #F8FAFC; border: 1px solid var(--border-color); margin-bottom: 30px; }
-        .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; margin-right: 5px; }
-        .dot.active { background-color: #10B981; box-shadow: 0 0 10px rgba(16,185,129,0.4); }
-        .dot.inactive { background-color: #EF4444; }
-        
-        .rule-list { display: grid; gap: 15px; margin-bottom: 30px; }
-        .rule-item { background: #F9FAFB; border: 1px solid #E5E7EB; padding: 15px 20px; border-radius: 10px; display: flex; justify-content: space-between; align-items: center; }
-        .rule-details h4 { margin: 0 0 5px 0; color: var(--text-main); }
-        .rule-details p { margin: 0; font-size: 13px; color: var(--text-muted); }
-        .rule-details .badge { background: #E0E7FF; color: #4338CA; padding: 3px 8px; border-radius: 6px; font-size: 12px; font-weight: bold; margin-left: 5px; }
-        
-        .form-group { margin-bottom: 20px; }
-        label { display: block; font-weight: 600; margin-bottom: 8px; }
-        .helper-text { font-size: 13px; color: var(--text-muted); margin-bottom: 8px; display: block; }
-        input[type="text"], textarea { width: 100%; padding: 14px; border: 1px solid var(--border-color); border-radius: 10px; box-sizing: border-box; font-family: inherit; }
-        textarea { resize: vertical; }
-        
-        .reply-box { background: #F9FAFB; border: 1px dashed #D1D5DB; padding: 20px; border-radius: 10px; margin-bottom: 20px; }
-        .reply-box textarea { min-height: 60px; margin-bottom: 10px; }
-        
-        .btn { padding: 14px 20px; border: none; border-radius: 10px; font-weight: bold; cursor: pointer; transition: 0.2s; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
-        .btn-primary { background: var(--primary); color: white; width: 100%; font-size: 16px; }
-        .btn-danger { background: #FEE2E2; color: #DC2626; padding: 8px 12px; font-size: 13px; }
-        .btn-danger:hover { background: #FECACA; }
-        .btn-toggle-on { background: #10B981; color: white; }
-        .btn-toggle-off { background: #EF4444; color: white; }
-        
-        .alert { padding: 16px; border-radius: 10px; margin-bottom: 20px; font-weight: 500; }
-        .alert-success { background: #D1FAE5; color: #065F46; border: 1px solid #A7F3D0; }
-        .alert-error { background: #FEE2E2; color: #991B1B; border: 1px solid #FECACA; }
-    </style>
-</head>
-<body>
 
-<div class="container">
-    <div class="header">
-        <h1>🎓 LGS Hocam</h1>
-        <p>Gelişmiş Çoklu DM & Yorum Otomasyonu (Takipçi Filtreli)</p>
-    </div>
+@app.post('/toggle')
+def toggle_rule():
+    mid = request.form.get('media_id', '')
+    if not mid.isdigit():
+        abort(400)
+    try:
+        path = 'automation_v2/rules/' + mid
+        item = cloud('GET', path)[0]
+        if item:
+            cloud('PATCH', path, {'enabled': not item.get('enabled', False)})
+    except ServiceError as exc:
+        flash(str(exc))
+    return redirect(url_for('index'))
 
-    {% if message %}
-    <div class="alert alert-{{ message_type }}">{{ message | safe }}</div>
-    {% endif %}
 
-    <div class="card status-box">
-        <div>
-            <div style="font-weight: bold; font-size: 18px;">
-                {% if config.get("enabled", True) %}
-                    <span class="dot active"></span> Sistem Aktif (15 Sn. Korumalı)
-                {% else %}
-                    <span class="dot inactive"></span> Sistem Durduruldu
-                {% endif %}
-            </div>
-            <p style="margin: 5px 0 0 0; color: var(--text-muted); font-size: 14px;">
-                Aktif Kural Sayısı: <b>{{ config.get("rules", [])|length }}</b>
-            </p>
-        </div>
-        <form method="POST" action="/toggle" style="margin: 0;">
-            {% if config.get("enabled", True) %}
-                <button type="submit" class="btn btn-toggle-off">⏸️ Tüm Sistemi Durdur</button>
-            {% else %}
-                <button type="submit" class="btn btn-toggle-on">▶️ Sistemi Başlat</button>
-            {% endif %}
-        </form>
-    </div>
+@app.post('/delete')
+def delete_rule():
+    mid = request.form.get('media_id', '')
+    if not mid.isdigit():
+        abort(400)
+    try:
+        cloud('DELETE', 'automation_v2/rules/' + mid)
+        flash('Video kuralı silindi; gönderim geçmişi korundu.')
+    except ServiceError as exc:
+        flash(str(exc))
+    return redirect(url_for('index'))
 
-    <div class="card">
-        <h2 style="margin-top: 0; font-size: 18px; border-bottom: 2px solid #F3F4F6; padding-bottom: 10px;">📋 Aktif Otomasyon Kuralları</h2>
-        
-        {% if not config.get("rules") %}
-            <p style="color: var(--text-muted); text-align: center; padding: 20px;">Henüz hiç kural eklemediniz. Aşağıdan yeni bir Reels videosu ekleyebilirsiniz.</p>
-        {% else %}
-            <div class="rule-list">
-                {% for rule in config.get("rules", []) %}
-                <div class="rule-item">
-                    <div class="rule-details">
-                        <h4>Şart: <span class="badge">"{{ rule.keyword }}"</span> kelimeleri</h4>
-                        <p><b>Video:</b> <a href="{{ rule.reel_url }}" target="_blank" style="color: var(--primary);">{{ rule.reel_url[:45] }}...</a></p>
-                        <p><b>Sadece Takipçi:</b> {{ 'Evet' if rule.follower_only else 'Hayır' }}</p>
-                    </div>
-                    <form action="/delete_rule/{{ rule.id }}" method="POST" style="margin: 0;" onsubmit="return confirm('Bu kuralı silmek istediğinize emin misiniz?');">
-                        <button type="submit" class="btn btn-danger">🗑️ Sil</button>
-                    </form>
-                </div>
-                {% endfor %}
-            </div>
-        {% endif %}
-    </div>
 
-    <div class="card">
-        <h2 style="margin-top: 0; font-size: 18px; border-bottom: 2px solid #F3F4F6; padding-bottom: 10px;">➕ Yeni Kural Ekle</h2>
-        <form method="POST">
-            <div class="form-group">
-                <label>📌 Instagram Reel Linki</label>
-                <input type="text" name="reel_url" placeholder="Yeni videonun linkini yapıştırın..." required>
-            </div>
-
-            <div class="form-group">
-                <label>🔑 Anahtar Kelimeler (Birden fazla için virgül kullanın)</label>
-                <span class="helper-text">Örn: mat, matematik, lgs</span>
-                <input type="text" name="keyword" placeholder="mat, matematik, lgs" required>
-            </div>
-
-            <div class="form-group">
-                <label><input type="checkbox" name="follower_only" value="1" checked> Sadece Takipçilere Gönder</label>
-            </div>
-
-            <div class="reply-box">
-                <h3 style="margin-top: 0; font-size: 15px;">📩 Rastgele Gidecek DM Mesajları (En az 1 tane zorunlu)</h3>
-                <textarea name="dm_1" placeholder="1. DM Alternatifi (Zorunlu) - Örn: Merhaba, işte link! 🚀" required></textarea>
-                <textarea name="dm_2" placeholder="2. DM Alternatifi (Opsiyonel)"></textarea>
-                <textarea name="dm_3" placeholder="3. DM Alternatifi (Opsiyonel)"></textarea>
-                <textarea name="dm_4" placeholder="4. DM Alternatifi (Opsiyonel)"></textarea>
-                <textarea name="dm_5" placeholder="5. DM Alternatifi (Opsiyonel)"></textarea>
-            </div>
-
-            <div class="reply-box">
-                <h3 style="margin-top: 0; font-size: 15px;">💬 Yoruma Verilecek Rastgele Cevaplar (Opsiyonel)</h3>
-                <input type="text" name="reply_1" placeholder="1. Cevap (Örn: İlgili linki DM attım 🚀)" style="margin-bottom: 10px;">
-                <input type="text" name="reply_2" placeholder="2. Cevap..." style="margin-bottom: 10px;">
-                <input type="text" name="reply_3" placeholder="3. Cevap..." style="margin-bottom: 10px;">
-                <input type="text" name="reply_4" placeholder="4. Cevap..." style="margin-bottom: 10px;">
-                <input type="text" name="reply_5" placeholder="5. Cevap...">
-            </div>
-
-            <button type="submit" class="btn btn-primary">🚀 Kuralı Kaydet ve Aktifleştir</button>
-        </form>
-    </div>
-</div>
-
-</body>
-</html>
-"""
-
-@app.get("/privacy-policy")
-def privacy_policy(): return "Gizlilik Politikası", 200
-@app.post("/deauthorize")
-def deauthorize(): return "OK", 200
-@app.post("/data-deletion")
-def data_deletion(): return jsonify({"url": "...", "confirmation_code": "..."}), 200
-@app.get("/data-deletion-status/<code>")
-def data_deletion_status(code): return "OK", 200
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--worker', action='store_true', help='Yalnızca bot çalışanını başlatır')
+    args = parser.parse_args()
+    validate_config()
+    if args.worker:
+        try:
+            background_bot_loop()
+        except KeyboardInterrupt:
+            STOP.set()
+    else:
+        threading.Thread(target=background_bot_loop, daemon=True).start()
+        # Reloader kapalı: aynı bot iki kez başlatılmaz.
+        from waitress import serve
+        try:
+            serve(app, host='0.0.0.0', port=int(os.getenv('PORT', '5000')), threads=4)
+        finally:
+            STOP.set()
