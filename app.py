@@ -309,6 +309,8 @@ def background_bot_loop():
 
 @app.before_request
 def protect_panel():
+    if request.endpoint == 'health' and request.method in ('GET', 'HEAD'):
+        return None
     auth = request.authorization
     if not PANEL_PASSWORD or not auth or not (
         hmac.compare_digest((auth.username or '').encode(), PANEL_USER.encode()) and
@@ -392,6 +394,12 @@ def update_cached_rule(mid, item):
         else:
             PANEL_CACHE['rules'][mid] = dict(item)
         PANEL_CACHE['updated_at'] = 0
+
+
+@app.get('/health')
+def health():
+    # Public liveness check: no credentials or external API calls.
+    return {'status': 'ok', 'scope': 'web_service'}, 200, {'Cache-Control': 'no-store'}
 
 
 @app.get('/')
