@@ -30,7 +30,7 @@ GRAPH_HOST = 'https://graph.instagram.com' if LOGIN_TYPE == 'instagram' else 'ht
 PANEL_USER = os.getenv('PANEL_USER', 'admin')
 PANEL_PASSWORD = os.getenv('PANEL_PASSWORD', '')
 POLL_SECONDS = max(15, int(os.getenv('POLL_SECONDS', '30')))
-SEND_DELAY = max(0, int(os.getenv('SEND_DELAY_SECONDS', '15')))
+SEND_DELAY = max(0, int(os.getenv('SEND_DELAY_SECONDS', '5')))
 STOP = threading.Event()
 EVENTS = deque(maxlen=50)
 EVENT_LOCK = threading.Lock()
