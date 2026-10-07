@@ -14,6 +14,9 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import requests
+import firebase_admin
+from firebase_admin import credentials
+from google.auth.transport.requests import AuthorizedSession
 from flask import Flask, abort, flash, redirect, render_template_string, request, session, url_for
 
 app = Flask(__name__)
@@ -23,7 +26,10 @@ app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax',
 ACCESS_TOKEN = os.getenv('ACCESS_TOKEN', '')
 IG_USER_ID = os.getenv('IG_USER_ID', '')
 FIREBASE_URL = os.getenv('FIREBASE_URL', '').rstrip('/')
-FIREBASE_AUTH = os.getenv('FIREBASE_AUTH', '')
+FIREBASE_SERVICE_ACCOUNT = os.getenv(
+    'FIREBASE_SERVICE_ACCOUNT',
+    '/etc/secrets/firebase-service-account.json'
+)
 API_VERSION = os.getenv('META_API_VERSION', '')
 LOGIN_TYPE = os.getenv('META_LOGIN_TYPE', 'facebook')
 GRAPH_HOST = 'https://graph.instagram.com' if LOGIN_TYPE == 'instagram' else 'https://graph.facebook.com'
@@ -35,7 +41,30 @@ STOP = threading.Event()
 EVENTS = deque(maxlen=50)
 EVENT_LOCK = threading.Lock()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+ # Firebase Admin SDK
+try:
+    if not os.path.isfile(FIREBASE_SERVICE_ACCOUNT):
+        raise RuntimeError(
+            'Firebase service account dosyasi bulunamadi: '
+            + FIREBASE_SERVICE_ACCOUNT
+        )
 
+    firebase_credential = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT)
+
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(
+            firebase_credential,
+            {'databaseURL': FIREBASE_URL}
+        )
+
+    firebase_session = AuthorizedSession(
+        firebase_credential.get_credential()
+    )
+
+except Exception as exc:
+    raise RuntimeError(
+        'Firebase Admin SDK baslatilamadi: ' + type(exc).__name__
+    ) from None
 
 class ServiceError(Exception):
     pass
@@ -144,17 +173,31 @@ def pages(path, fields):
 
 def cloud(method, path, value=None, headers=None):
     try:
-        res = requests.request(method, f'{FIREBASE_URL}/{path}.json',
-            params={'auth': FIREBASE_AUTH} if FIREBASE_AUTH else None,
-            json=value, headers=headers, timeout=(5, 20))
+        res = firebase_session.request(
+            method,
+            f'{FIREBASE_URL}/{path}.json',
+            json=value,
+            headers=headers,
+            timeout=(5, 20)
+        )
+
         if res.status_code == 412:
             return None, None, False
+
         if not res.ok:
-            raise ServiceError(f'Firebase HTTP {res.status_code}; okuma/yazma başarısız.')
-        return res.json(), res.headers.get('ETag'), True
+            raise ServiceError(
+                f'Firebase HTTP {res.status_code}; okuma/yazma başarısız.'
+            )
+
+        if res.status_code == 204 or not res.content:
+            data = None
+        else:
+            data = res.json()
+
+        return data, res.headers.get('ETag'), True
+
     except (requests.RequestException, ValueError):
         raise ServiceError('Firebase bağlantı hatası.') from None
-
 
 def rules():
     data = cloud('GET', 'automation_v2/rules')[0] or {}
