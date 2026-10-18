@@ -1,4 +1,4 @@
-""Reels yorum otomasyonu. Kurulum için KURULUM.md dosyasını okuyun."""
+"""Reels yorum otomasyonu. Kurulum için KURULUM.md dosyasını okuyun."""
 import argparse
 import hashlib
 import hmac
