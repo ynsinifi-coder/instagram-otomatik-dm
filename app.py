@@ -1,112 +1,96 @@
-    mid = (request.form.get('media_id') or request.form.get('selected_media') or '').strip()
-    link = request.form.get('reel_url', '').strip()
-    if not link and not mid.isdigit():
-        flash('Reels bağlantısı yapıştırın veya listeden video seçin.')
-        return redirect(url_for('index'))
-    plans = []
-    mode = request.form.get('message_mode', 'single')
-    if mode == 'plans':
-        for i in range(6):
-            trigger = request.form.get(f'plan_trigger_{i}', '').strip()
-            dm = request.form.get(f'plan_dm_{i}', '').strip()
-            reply = request.form.get(f'plan_reply_{i}', '').strip()
-            if not any((trigger, dm, reply)):
-                continue
-            if not all((trigger, dm, reply)) or len(trigger)>100 or len(dm)>1000 or len(reply)>1000:
-                flash('Her plan için yorum, DM ve yorum yanıtı dolu olmalı. Mesajlar en fazla 1000 karakter.')
-                return redirect(url_for('index', edit=mid))
-            plans.append({'trigger': trigger, 'dm_variants': [x.strip() for x in dm.split('---') if x.strip()], 'reply_variants': [x.strip() for x in reply.split('---') if x.strip()]})
-        if not plans or any(not p['dm_variants'] or not p['reply_variants'] for p in plans) or len({normalized(p['trigger']) for p in plans}) != len(plans):
-            flash('En az bir dolu plan ekleyin; yorum tetikleyicileri farklı olmalı.')
-            return redirect(url_for('index', edit=mid))
-    dms = [request.form.get(f'dm_{i}', '').strip() for i in range(4)]
-    replies = list(dict.fromkeys(x.strip() for x in request.form.get('replies', '').splitlines() if x.strip()))
-    keywords = list(dict.fromkeys(x.strip() for x in request.form.get('keywords', '').splitlines() if x.strip()))
-    if mode != 'plans' and (any(not x or len(x) > 1000 for x in dms) or len(set(dms)) != 4 or len(replies) < 2 or any(len(x) > 1000 for x in replies)):
-        flash('Dört farklı ve dolu DM seçeneği, en az iki farklı yorum yanıtı gerekli. Her metin en fazla 1000 karakter.')
-        return redirect(url_for('index', edit=mid))
+   """Reels yorum otomasyonu. Kurulum için KURULUM.md dosyasını okuyun."""
+import argparse
+import hashlib
+import hmac
+import logging
+import os
+import random
+import re
+import secrets
+import threading
+import time
+from collections import deque
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+import requests
+import firebase_admin
+from firebase_admin import credentials
+from google.auth.transport.requests import AuthorizedSession
+from flask import Flask, abort, flash, redirect, render_template_string, request, session, url_for
+
+app = Flask(__name__)
+app.secret_key = os.getenv('SECRET_KEY') or secrets.token_hex(32)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax',
+                  SESSION_COOKIE_SECURE=os.getenv('COOKIE_SECURE') == '1', MAX_CONTENT_LENGTH=65536)
+ACCESS_TOKEN = os.getenv('ACCESS_TOKEN', '')
+IG_USER_ID = os.getenv('IG_USER_ID', '')
+FIREBASE_URL = os.getenv('FIREBASE_URL', '').rstrip('/')
+FIREBASE_SERVICE_ACCOUNT = os.getenv(
+    'FIREBASE_SERVICE_ACCOUNT',
+    '/etc/secrets/firebase-service-account.json'
+)
+API_VERSION = os.getenv('META_API_VERSION', '')
+LOGIN_TYPE = os.getenv('META_LOGIN_TYPE', 'facebook')
+GRAPH_HOST = 'https://graph.instagram.com' if LOGIN_TYPE == 'instagram' else 'https://graph.facebook.com'
+PANEL_USER = os.getenv('PANEL_USER', 'admin')
+PANEL_PASSWORD = os.getenv('PANEL_PASSWORD', '')
+POLL_SECONDS = max(30, int(os.getenv('POLL_SECONDS', '120')))
+SEND_DELAY = max(0, int(os.getenv('SEND_DELAY_SECONDS', '5')))
+STOP = threading.Event()
+EVENTS = deque(maxlen=50)
+EVENT_LOCK = threading.Lock()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+ # Firebase Admin SDK
+try:
+    if not os.path.isfile(FIREBASE_SERVICE_ACCOUNT):
+        raise RuntimeError(
+            'Firebase service account dosyasi bulunamadi: '
+            + FIREBASE_SERVICE_ACCOUNT
+        )
+
+    firebase_credential = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT)
+
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(
+            firebase_credential,
+            {'databaseURL': FIREBASE_URL}
+        )
+
+    firebase_session = AuthorizedSession(
+        firebase_credential.get_credential()
+    )
+
+except Exception as exc:
+    raise RuntimeError(
+        'Firebase Admin SDK baslatilamadi: ' + type(exc).__name__
+    ) from None
+
+class ServiceError(Exception):
+    pass
+
+
+def event(message):
+    logging.info(message)
+    with EVENT_LOCK:
+        EVENTS.appendleft(time.strftime('%H:%M:%S') + ' — ' + message)
+
+
+def validate_config():
+    missing = [name for name, value in [('ACCESS_TOKEN', ACCESS_TOKEN), ('IG_USER_ID', IG_USER_ID),
+               ('FIREBASE_URL', FIREBASE_URL), ('META_API_VERSION', API_VERSION),
+               ('PANEL_PASSWORD', PANEL_PASSWORD), ('SECRET_KEY', os.getenv('SECRET_KEY'))] if not value]
+    if missing:
+        raise SystemExit('Eksik ortam değişkenleri: ' + ', '.join(missing))
+    if LOGIN_TYPE not in ('facebook', 'instagram') or not re.fullmatch(r'v\d+\.\d+', API_VERSION):
+        raise SystemExit('META_LOGIN_TYPE veya META_API_VERSION geçersiz.')
+    if urlparse(FIREBASE_URL).scheme != 'https':
+        raise SystemExit('FIREBASE_URL HTTPS olmalı.')
+
+
+def graph(method, path, *, params=None, payload=None):
+    """Gönderimlerde otomatik tekrar yok; hata çıktısında token/yanıt gövdesi yok."""
+    uncertain = ' Gönderim sonucu belirsiz olabilir; otomatik tekrar yapılmaz.' if method != 'GET' else ''
     try:
-        # Yalnızca hesaba ait Reels seçilmesine izin verilir.
-        code = reel_code(link) if link else None
-        media = None
-        for candidate in account_reels():
-            if code:
-                try:
-                    found = reel_code(candidate.get('permalink', '')) == code
-                except ServiceError:
-                    found = False
-            else:
-                found = str(candidate['id']) == mid
-            if found:
-                media = candidate
-                break
-        if not media:
-            flash('Bu video bağlı hesabın erişilebilir Reels listesinde bulunamadı. Hesap ID’si, token ve izinleri kontrol edin.')
-            return redirect(url_for('index'))
-        mid = str(media['id'])
-        old = cloud('GET', 'automation_v2/rules/' + mid)[0] or {}
-        old_plans = {normalized(p['trigger']):p for p in old.get('plans', [])}
-        for plan in plans:
-            plan['created_at'] = old_plans.get(normalized(plan['trigger']), {}).get('created_at', time.time())
-        item = {'media_id': mid, 'title': media.get('caption', '')[:100],
-              'keywords': keywords if not plans else [], 'dm_variants': dms if not plans else [], 'reply_variants': replies if not plans else [], 'plans': plans,
-              'permalink': media.get('permalink', ''),
-              'follower_only': request.form.get('audience', 'followers') != 'everyone',
-              'created_at': old.get('created_at', time.time()), 'enabled': old.get('enabled', True)}
-        cloud('PUT', 'automation_v2/rules/' + mid, item)
-        update_cached_rule(mid, item)
-        flash('Video kuralı kaydedildi.')
-    except ServiceError as exc:
-        flash(str(exc))
-    return redirect(url_for('index'))
-
-
-@app.post('/toggle')
-def toggle_rule():
-    mid = request.form.get('media_id', '')
-    if not mid.isdigit():
-        abort(400)
-    try:
-        path = 'automation_v2/rules/' + mid
-        item = cloud('GET', path)[0]
-        if item:
-            item['enabled'] = not item.get('enabled', False)
-            cloud('PATCH', path, {'enabled': item['enabled']})
-            update_cached_rule(mid, item)
-    except ServiceError as exc:
-        flash(str(exc))
-    return redirect(url_for('index'))
-
-
-@app.post('/delete')
-def delete_rule():
-    mid = request.form.get('media_id', '')
-    if not mid.isdigit():
-        abort(400)
-    try:
-        cloud('DELETE', 'automation_v2/rules/' + mid)
-        update_cached_rule(mid, None)
-        flash('Video kuralı silindi; gönderim geçmişi korundu.')
-    except ServiceError as exc:
-        flash(str(exc))
-    return redirect(url_for('index'))
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--worker', action='store_true', help='Yalnızca bot çalışanını başlatır')
-    args = parser.parse_args()
-    validate_config()
-    if args.worker:
-        try:
-            background_bot_loop()
-        except KeyboardInterrupt:
-            STOP.set()
-    else:
-        threading.Thread(target=background_bot_loop, daemon=True).start()
-        # Reloader kapalı: aynı bot iki kez başlatılmaz.
-        from waitress import serve
-        try:
-            serve(app, host='0.0.0.0', port=int(os.getenv('PORT', '5000')), threads=4)
-        finally:
-            STOP.set()
+        res = requests.request(method, f'{GRAPH_HOST}/{API_VERSION}/{path}',
+            headers={'Authorization': 'Bearer ' + ACCESS_TOKEN.strip()}, params=params,
