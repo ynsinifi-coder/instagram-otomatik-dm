@@ -1,7 +1,8 @@
-"""Reels yorum otomasyonu. Kurulum için KURULUM.md dosyasını okuyun."""
+""Reels yorum otomasyonu. Kurulum için KURULUM.md dosyasını okuyun."""
 import argparse
 import hashlib
 import hmac
+import json
 import logging
 import os
 import random
@@ -35,36 +36,32 @@ LOGIN_TYPE = os.getenv('META_LOGIN_TYPE', 'facebook')
 GRAPH_HOST = 'https://graph.instagram.com' if LOGIN_TYPE == 'instagram' else 'https://graph.facebook.com'
 PANEL_USER = os.getenv('PANEL_USER', 'admin')
 PANEL_PASSWORD = os.getenv('PANEL_PASSWORD', '')
-POLL_SECONDS = max(15, int(os.getenv('POLL_SECONDS', '30')))
+POLL_SECONDS = max(60, int(os.getenv('POLL_SECONDS', '120')))
 SEND_DELAY = max(0, int(os.getenv('SEND_DELAY_SECONDS', '5')))
 STOP = threading.Event()
 EVENTS = deque(maxlen=50)
 EVENT_LOCK = threading.Lock()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
- # Firebase Admin SDK
+# Railway: Firebase JSON ortam degiskeni veya Render: gizli dosya desteklenir.
+# Kimlik bilgileri GitHub'a kesinlikle eklenmemelidir.
 try:
-    if not os.path.isfile(FIREBASE_SERVICE_ACCOUNT):
-        raise RuntimeError(
-            'Firebase service account dosyasi bulunamadi: '
-            + FIREBASE_SERVICE_ACCOUNT
-        )
-
-    firebase_credential = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT)
+    firebase_json = os.getenv('FIREBASE_SERVICE_ACCOUNT_JSON', '').strip()
+    if firebase_json:
+        service_account_data = json.loads(firebase_json)
+        if not isinstance(service_account_data, dict) or not service_account_data.get('private_key'):
+            raise ValueError('Firebase service account JSON eksik veya gecersiz.')
+        firebase_credential = credentials.Certificate(service_account_data)
+    else:
+        if not os.path.isfile(FIREBASE_SERVICE_ACCOUNT):
+            raise FileNotFoundError('Firebase kimlik bilgisi yok: FIREBASE_SERVICE_ACCOUNT_JSON tanimlayin.')
+        firebase_credential = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT)
 
     if not firebase_admin._apps:
-        firebase_admin.initialize_app(
-            firebase_credential,
-            {'databaseURL': FIREBASE_URL}
-        )
-
-    firebase_session = AuthorizedSession(
-        firebase_credential.get_credential()
-    )
-
+        firebase_admin.initialize_app(firebase_credential, {'databaseURL': FIREBASE_URL})
+    firebase_session = AuthorizedSession(firebase_credential.get_credential())
 except Exception as exc:
-    raise RuntimeError(
-        'Firebase Admin SDK baslatilamadi: ' + type(exc).__name__
-    ) from None
+    # Anahtar, JSON icerigi veya dosya yolu loglara yazilmaz.
+    raise RuntimeError('Firebase Admin SDK baslatilamadi: ' + type(exc).__name__) from None
 
 class ServiceError(Exception):
     pass
@@ -152,7 +149,7 @@ def account_reels():
 
 def media_diagnostic(exc=None):
     message = str(exc) if exc else 'Meta hesabınız için erişilebilir Reels döndürmedi.'
-    return message + ' Render’da META_LOGIN_TYPE=instagram ve IG_USER_ID değerini, tokenın bağlı hesabını ve instagram_business_basic iznini kontrol edin. Bağlantı eklemek eksik API iznini gidermez.'
+    return message + ' Railway üzerinde META_LOGIN_TYPE=instagram ve IG_USER_ID değerini, tokenın bağlı hesabını ve instagram_business_basic iznini kontrol edin. Bağlantı eklemek eksik API iznini gidermez.'
 
 
 def pages(path, fields):
