@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 import requests
 import firebase_admin
 from firebase_admin import credentials
+import json
 from google.auth.transport.requests import AuthorizedSession
 from flask import Flask, abort, flash, redirect, render_template_string, request, session, url_for
 
