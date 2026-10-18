@@ -45,7 +45,7 @@ STOP = threading.Event()
 EVENTS = deque(maxlen=50)
 EVENT_LOCK = threading.Lock()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
- firebase_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+ if not os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") and not os.path.isfile(FIREBASE_SERVICE_ACCOUNT):
 
 if firebase_json:
     firebase_credential = credentials.Certificate(json.loads(firebase_json))
