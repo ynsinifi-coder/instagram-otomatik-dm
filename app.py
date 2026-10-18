@@ -45,29 +45,12 @@ STOP = threading.Event()
 EVENTS = deque(maxlen=50)
 EVENT_LOCK = threading.Lock()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
- # Firebase Admin SDK
-try:
-    if not os.path.isfile(FIREBASE_SERVICE_ACCOUNT):
-        raise RuntimeError(
-            'Firebase service account dosyasi bulunamadi: '
-            + FIREBASE_SERVICE_ACCOUNT
-        )
+ firebase_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
 
+if firebase_json:
+    firebase_credential = credentials.Certificate(json.loads(firebase_json))
+else:
     firebase_credential = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT)
-
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app(
-            firebase_credential,
-            {'databaseURL': FIREBASE_URL}
-        )
-
-    firebase_session = AuthorizedSession(
-        firebase_credential.get_credential()
-    )
-
-except Exception as exc:
-    raise RuntimeError(
-        'Firebase Admin SDK baslatilamadi: ' + type(exc).__name__
     ) from None
 
 class ServiceError(Exception):
