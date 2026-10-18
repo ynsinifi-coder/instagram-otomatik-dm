@@ -2,6 +2,7 @@
 import argparse
 import hashlib
 import hmac
+import json
 import logging
 import os
 import random
@@ -16,7 +17,6 @@ from urllib.parse import urlparse
 import requests
 import firebase_admin
 from firebase_admin import credentials
-import json
 from google.auth.transport.requests import AuthorizedSession
 from flask import Flask, abort, flash, redirect, render_template_string, request, session, url_for
 
@@ -37,21 +37,27 @@ GRAPH_HOST = 'https://graph.instagram.com' if LOGIN_TYPE == 'instagram' else 'ht
 PANEL_USER = os.getenv('PANEL_USER', 'admin')
 PANEL_PASSWORD = os.getenv('PANEL_PASSWORD', '')
 POLL_SECONDS = max(30, int(os.getenv('POLL_SECONDS', '120')))
-POLL_ENABLED = os.getenv('POLL_ENABLED', '0') == '1'
-WEBHOOK_VERIFY_TOKEN = os.getenv('WEBHOOK_VERIFY_TOKEN', '')
-META_APP_SECRET = os.getenv('META_APP_SECRET', '')
 SEND_DELAY = max(0, int(os.getenv('SEND_DELAY_SECONDS', '5')))
 STOP = threading.Event()
 EVENTS = deque(maxlen=50)
 EVENT_LOCK = threading.Lock()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
- if not os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON") and not os.path.isfile(FIREBASE_SERVICE_ACCOUNT):
+# Firebase Admin SDK: Render dosyasi veya Railway gizli JSON degiskeni.
+try:
+    firebase_json = os.getenv('FIREBASE_SERVICE_ACCOUNT_JSON', '').strip()
+    if firebase_json:
+        firebase_credential = credentials.Certificate(json.loads(firebase_json))
+    else:
+        if not os.path.isfile(FIREBASE_SERVICE_ACCOUNT):
+            raise FileNotFoundError('Firebase service account dosyasi bulunamadi')
+        firebase_credential = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT)
 
-if firebase_json:
-    firebase_credential = credentials.Certificate(json.loads(firebase_json))
-else:
-    firebase_credential = credentials.Certificate(FIREBASE_SERVICE_ACCOUNT)
-    ) from None
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app(firebase_credential, {'databaseURL': FIREBASE_URL})
+
+    firebase_session = AuthorizedSession(firebase_credential.get_credential())
+except Exception as exc:
+    raise RuntimeError('Firebase Admin SDK baslatilamadi: ' + type(exc).__name__) from None
 
 class ServiceError(Exception):
     pass
@@ -78,3 +84,13 @@ def validate_config():
 def graph(method, path, *, params=None, payload=None):
     """Gönderimlerde otomatik tekrar yok; hata çıktısında token/yanıt gövdesi yok."""
     uncertain = ' Gönderim sonucu belirsiz olabilir; otomatik tekrar yapılmaz.' if method != 'GET' else ''
+    try:
+        res = requests.request(method, f'{GRAPH_HOST}/{API_VERSION}/{path}',
+            headers={'Authorization': 'Bearer ' + ACCESS_TOKEN.strip()}, params=params,
+            json=payload, timeout=(10, 45))
+    except requests.RequestException as exc:
+        kind = type(exc).__name__
+        hints = {'ConnectTimeout': 'Meta sunucusuna bağlantı zaman aşımı.',
+                 'ReadTimeout': 'Meta yanıtı beklenirken zaman aşımı.',
+                 'SSLError': 'Meta bağlantısında TLS sertifika hatası.',
+                 'ConnectionError': 'Meta sunucusuna ağ/DNS bağlantısı kurulamadı.'}
