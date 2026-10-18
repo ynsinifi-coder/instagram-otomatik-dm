@@ -1,4 +1,4 @@
-   """Reels yorum otomasyonu. Kurulum için KURULUM.md dosyasını okuyun."""
+"""Reels yorum otomasyonu. Kurulum için KURULUM.md dosyasını okuyun."""
 import argparse
 import hashlib
 import hmac
@@ -36,6 +36,9 @@ GRAPH_HOST = 'https://graph.instagram.com' if LOGIN_TYPE == 'instagram' else 'ht
 PANEL_USER = os.getenv('PANEL_USER', 'admin')
 PANEL_PASSWORD = os.getenv('PANEL_PASSWORD', '')
 POLL_SECONDS = max(30, int(os.getenv('POLL_SECONDS', '120')))
+POLL_ENABLED = os.getenv('POLL_ENABLED', '0') == '1'
+WEBHOOK_VERIFY_TOKEN = os.getenv('WEBHOOK_VERIFY_TOKEN', '')
+META_APP_SECRET = os.getenv('META_APP_SECRET', '')
 SEND_DELAY = max(0, int(os.getenv('SEND_DELAY_SECONDS', '5')))
 STOP = threading.Event()
 EVENTS = deque(maxlen=50)
@@ -91,6 +94,3 @@ def validate_config():
 def graph(method, path, *, params=None, payload=None):
     """Gönderimlerde otomatik tekrar yok; hata çıktısında token/yanıt gövdesi yok."""
     uncertain = ' Gönderim sonucu belirsiz olabilir; otomatik tekrar yapılmaz.' if method != 'GET' else ''
-    try:
-        res = requests.request(method, f'{GRAPH_HOST}/{API_VERSION}/{path}',
-            headers={'Authorization': 'Bearer ' + ACCESS_TOKEN.strip()}, params=params,
